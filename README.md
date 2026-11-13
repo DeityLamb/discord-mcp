@@ -1,120 +1,85 @@
 # discord-mcp
 
-An MCP server that gives an agent the whole Discord API through five tools, acting as your bot.
+[![CI](https://github.com/DeityLamb/discord-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/DeityLamb/discord-mcp/actions/workflows/ci.yml)
 
-| Tool | What it does |
+**The whole Discord API for your agent, in five tools.** Every one of the 250 REST endpoints, every
+gateway event, and the API reference to find them, acting as your bot.
+
+| Tool | Covers |
 | --- | --- |
-| `discord_docs` | The Discord REST API reference: search endpoints, read one in full, look up a type. |
-| `discord_get` | Any `GET` endpoint. Read-only, so a client can allow it without asking. |
-| `discord_call` | Any `POST`, `PUT`, `PATCH` or `DELETE` endpoint, with file uploads and an audit-log reason. |
-| `discord_events` | What happens as it happens (messages, reactions, members joining), from the gateway. |
-| `discord_gateway` | Gateway commands: set the bot's status and activity, look up members with their online status. |
+| `discord_docs` | The API reference, built from [Discord's OpenAPI spec](https://github.com/discord/discord-api-spec) and refreshed daily: search endpoints, read one in full, look up a type. |
+| `discord_get` | Every `GET` endpoint: servers, channels, messages, members, roles, threads, emojis... |
+| `discord_call` | Every `POST`, `PUT`, `PATCH` and `DELETE`: send, edit, react, moderate, manage, with file uploads and audit-log reasons. |
+| `discord_events` | Every gateway event, live: messages, reactions, joins, edits. Wait for one, filter, page by cursor. |
+| `discord_gateway` | Gateway commands: the bot's status and activity, member lookups with online status. |
 
-There is no tool per endpoint. The agent finds the endpoint in `discord_docs`, then calls it; a `jq`
-argument on every call keeps long responses out of its context.
+There is no tool per endpoint, so nothing is missing and new endpoints work the day Discord adds them.
+The agent looks the endpoint up in `discord_docs` and calls it, and a `jq` argument on every call keeps
+long responses short. Rate limits are handled for it.
 
-## Setup
+## Install
 
-1. Create an application at <https://discord.com/developers/applications>, add a bot, and copy the
-   bot token from its **Bot** page. Invite the bot to your server with the permissions you want it to have.
-2. To read what other people write, switch on **Message Content Intent** on the same page. To list
-   members, switch on **Server Members Intent**.
-3. Install: download a binary for your platform from
-   [Releases](https://github.com/DeityLamb/discord-mcp/releases), or build it:
+```sh
+# Linux, macOS
+curl -fsSL https://raw.githubusercontent.com/DeityLamb/discord-mcp/main/install.sh | sh
 
-   ```sh
-   cargo install --git https://github.com/DeityLamb/discord-mcp
-   ```
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/DeityLamb/discord-mcp/main/install.ps1 | iex
 
-4. Add it to your MCP client with the token in its environment. For Claude Code:
+# With Cargo: a prebuilt binary, or built from source
+cargo binstall discord-mcp
+cargo install discord-mcp
+```
+
+Or download a binary from [Releases](https://github.com/DeityLamb/discord-mcp/releases).
+
+## Set up
+
+1. Create an application at <https://discord.com/developers/applications>, add a bot, copy its token,
+   and invite it to your server. To read message text, switch on **Message Content Intent** on the
+   Bot page; to list members, **Server Members Intent**.
+2. Add the server to your client. For Claude Code:
 
    ```sh
    claude mcp add discord -s user -e DISCORD_TOKEN=<bot token> -- discord-mcp
    ```
 
-   Or in a client's JSON config:
+   Elsewhere: command `discord-mcp`, with `DISCORD_TOKEN` in its environment.
 
-   ```json
-   {
-     "mcpServers": {
-       "discord": {
-         "command": "discord-mcp",
-         "env": { "DISCORD_TOKEN": "your bot token" }
-       }
-     }
-   }
-   ```
-
-Without a token the server still starts, and `discord_docs` works.
+Without a token, `discord_docs` still works.
 
 ## Options
 
 | Flag | Effect |
 | --- | --- |
-| `--read-only` | Leaves out `discord_call` and `discord_gateway`: nothing on Discord can be changed. |
-| `--disable-gateway` | No `discord_events` or `discord_gateway`, no background hub, and the bot stays offline. |
-| `--intents <list>` | Gateway intents by name, e.g. `guilds,guild_messages,message_content`. By default: all but typing and presences, plus the privileged ones the bot has switched on. |
-| `--no-hub` | Keeps the gateway in the session's own process instead of sharing a hub. |
-| `--allow-unlisted` | Also sends requests to paths the API reference doesn't list. |
-| `--no-spec-update` | Uses the API reference compiled into the binary and never fetches a newer one. |
-| `--max-output <chars>` | Most characters one tool call returns (default 40000). |
+| `--read-only` | Nothing on Discord can be changed: no `discord_call` or `discord_gateway`. |
+| `--disable-gateway` | REST only: no events, no background process, the bot stays offline. |
+| `--intents <list>` | Gateway intents, e.g. `guilds,guild_messages,message_content`. Default: all but typing and presences, plus the privileged ones switched on for the bot. |
+| `--no-hub` | Keep the gateway in this process instead of sharing it. |
+| `--allow-unlisted` | Allow paths the API reference doesn't list. |
+| `--no-spec-update` | Use the built-in API reference only. |
+| `--max-output <chars>` | Longest answer of one call (default 40000). |
 
-`discord-mcp call <tool> '<json>'` runs one tool call from a shell, and `discord-mcp call --list`
-prints the tools with their arguments.
+`discord-mcp call <tool> '<json>'` runs one call from a shell.
 
 ## Several clients at once
 
-Each MCP client starts its own `discord-mcp`, but a bot should have one gateway connection, not one
-per client. So the first session starts a background **hub** and every session is a thin pipe to it:
+A bot should have one gateway connection, but each client starts its own server. So the first one
+starts a background hub, which keeps the connection, the event buffer and the rate limits, and every
+session talks to it over loopback, authenticated by a secret file only you can read. Each session
+reads events by its own cursor, without taking them from the others. The hub leaves a minute after
+its last session.
 
-```
-client 1 ── stdio ── discord-mcp ─┐
-client 2 ── stdio ── discord-mcp ─┼─ loopback ── hub ── REST + gateway ── Discord
-client 3 ── stdio ── discord-mcp ─┘
-```
+## Safety
 
-- The hub holds the gateway session, the event buffer and the rate-limit state.
-- It listens on loopback only; a session must present a secret from a file only your user can read.
-- It leaves a minute after its last session, saying goodbye to Discord so the bot goes offline.
-- The gateway connects on the first `discord_events` call, so sessions that only use REST never open it.
-- Sessions keep their own options: one can be `--read-only` while another is not.
-- The bot has one presence: a status set by one session is what every session's bot shows, and it
-  stays set across reconnects until changed.
+- The agent can do whatever the bot can. Give the bot only the permissions you want used, or run
+  `--read-only`.
+- Discord content is written by other people and may contain instructions aimed at the agent; keep
+  `discord_call` behind your client's approval prompt.
+- `discord_call` uploads local files it is given paths to.
+- The token goes to Discord only: it is never printed, and `jq` can't read the environment.
 
-## Waiting for something
-
-Events are buffered, and each has a cursor. A reader never takes events from another reader. To act
-and then wait for the response:
-
-1. `discord_events {}` returns the current cursor.
-2. `discord_call` makes the change, for example sends a message.
-3. `discord_events {"after": <cursor>, "types": ["MESSAGE_CREATE"], "filter": ".channel_id == \"…\"", "wait": 60}`
-   returns as soon as a matching event arrives.
-
-## What to know before giving it to an agent
-
-- **It acts as your bot.** Whatever the bot may do on Discord, the agent may do. Give the bot only the
-  permissions you want used, and use `--read-only` where reading is enough.
-- **Discord content is untrusted.** Messages, names and topics are written by other people and may
-  contain instructions aimed at the agent. The tool descriptions say so; keep `discord_call` behind
-  your client's approval prompt.
-- **Uploads read local files.** `discord_call` sends the files it is given paths to.
-- **The token stays put.** It is sent to Discord and nowhere else, never printed, and `jq` filters
-  cannot read the environment.
-
-## Files it keeps
-
-- The API reference, refreshed at most once a day from
-  [discord/discord-api-spec](https://github.com/discord/discord-api-spec): the user cache directory
-  (`~/.cache/discord-mcp` on Linux), or `DISCORD_MCP_CACHE_DIR`.
-- The hub's address file, lock and log: `$XDG_RUNTIME_DIR/discord-mcp` on Linux, or
-  `DISCORD_MCP_STATE_DIR`.
-
-`DISCORD_MCP_LOG` sets the log filter (for example `debug`); logs go to stderr, and the hub's to its log file.
-
-## Not supported
-
-Voice, and sharding (bots in 2500 or more servers).
+Not supported: voice, and sharding (bots in 2500+ servers).
 
 ## Development
 
@@ -122,14 +87,8 @@ Voice, and sharding (bots in 2500 or more servers).
 cargo test
 ```
 
-The tests run the real binary against a stand-in for Discord's REST API and gateway; no token or
-network is needed. To refresh the bundled reference:
-
-```sh
-curl -sSL -o spec/openapi.json https://raw.githubusercontent.com/discord/discord-api-spec/main/specs/openapi.json
-```
+The tests run the real binary against a stand-in Discord REST API and gateway; no token needed.
 
 ## License
 
-GPL-3.0-or-later; see `LICENSE`. The bundled `spec/openapi.json` is Discord's, under the MIT license in
-`spec/LICENSE`.
+GPL-3.0-or-later. The bundled `spec/openapi.json` is Discord's, under the MIT license in `spec/LICENSE`.

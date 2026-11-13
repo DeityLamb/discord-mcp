@@ -358,19 +358,18 @@ impl Tools {
         definitions(&self.options, self.gateway.is_some())
     }
 
-    fn no_gateway(&self) -> String {
+    fn no_gateway(&self) -> &'static str {
         if self.rest.is_none() {
-            "No bot token: set DISCORD_TOKEN in this server's environment, then reconnect.".to_owned()
+            "No bot token: set DISCORD_TOKEN in this server's environment, then reconnect."
         } else {
             "This server runs without the gateway (--disable-gateway), so there are no events or gateway \
              commands. REST still answers what happened: recent messages with GET /channels/{channel_id}/messages."
-                .to_owned()
         }
     }
 
     async fn gateway_command(&self, args: GatewayArgs) -> Result<String, String> {
         let Some(gateway) = &self.gateway else {
-            return Err(self.no_gateway());
+            return Err(self.no_gateway().into());
         };
         let data = args.data.unwrap_or_else(|| Value::Object(Map::new()));
         match args.op {
@@ -407,7 +406,7 @@ impl Tools {
     /// Events from the gateway's buffer, waiting for one if asked to.
     async fn events(&self, args: EventsArgs) -> Result<String, String> {
         let Some(gateway) = &self.gateway else {
-            return Err(self.no_gateway());
+            return Err(self.no_gateway().into());
         };
         // The first call opens the session; its cursor should point past the servers arriving.
         if gateway.start() || matches!(gateway.state(), State::Connecting) {
@@ -497,8 +496,7 @@ impl Tools {
         };
         let (path, mut query) = normalize_path(&wanted.path)?;
         query.extend(wanted.query);
-        let method = wanted.method.as_str().to_owned();
-        let method = method.as_str();
+        let method = wanted.method.as_str();
         // Without a reference (the first download failed) the request still goes out, unchecked.
         let (spec, unchecked) = match spec::wait(SPEC_WAIT).await {
             Ok(spec) => (Some(spec), None),
@@ -515,26 +513,28 @@ impl Tools {
                 path: template,
                 allowed,
             } => {
-                let other_tool = if wanted.method == Method::GET { CALL } else { GET };
+                // The methods it takes are the other tool's: say so.
+                let get = wanted.method == Method::GET;
+                let other_tool = if get != allowed.contains(&"GET") {
+                    format!(" Use {} for that.", if get { CALL } else { GET })
+                } else {
+                    String::new()
+                };
                 return Err(format!(
-                    "{template} doesn't take {method}; it takes {}.{}",
-                    allowed.join(", "),
-                    if (wanted.method == Method::GET) != allowed.contains(&"GET") {
-                        format!(" Use {other_tool} for that.")
-                    } else {
-                        String::new()
-                    }
+                    "{template} doesn't take {method}; it takes {}.{other_tool}",
+                    allowed.join(", ")
                 ));
             }
             Route::Unknown { nearest } => return Err(docs::unknown_route(method, &path, &nearest)),
         };
+        let bucket = match operation {
+            Some(operation) => operation.bucket_key(&path),
+            None => format!("{method}{path}"),
+        };
         let (files, layout) = self.uploads(spec.as_deref(), operation, wanted.files).await?;
         let request = Request {
             method: wanted.method,
-            bucket: match operation {
-                Some(operation) => operation.bucket_key(&path),
-                None => format!("{method}{path}"),
-            },
+            bucket,
             path,
             query,
             body: wanted.body,
@@ -777,43 +777,41 @@ fn failure(status: u16, reason: Option<&str>, body: &Body, operation: Option<&Op
         Body::Text(text) => out.push_str(&format!(": {}", text.chars().take(500).collect::<String>())),
         Body::Empty | Body::Binary { .. } => {}
     }
-    let entry = operation
-        .map(|o| format!("discord_docs {{\"operation\": \"{}\"}}", o.id))
-        .unwrap_or_else(|| "discord_docs".into());
+    let entry = match operation {
+        Some(operation) => format!("discord_docs {{\"operation\": \"{}\"}}", operation.id),
+        None => "discord_docs".into(),
+    };
+    // The hints that name the endpoint's entry are made here; the rest are fixed text.
+    let named;
     let hint = match (status, code) {
-        (401, _) => Some(
+        (401, _) => {
             "Discord rejected the bot token. DISCORD_TOKEN must be the token from the application's Bot page, not \
              its client secret or public key."
-                .to_owned(),
-        ),
-        (_, Some(50001)) => {
-            Some("The bot can't see this: it isn't in that server, or it lacks View Channel there.".to_owned())
         }
-        (_, Some(50013)) => Some(
+        (_, Some(50001)) => "The bot can't see this: it isn't in that server, or it lacks View Channel there.",
+        (_, Some(50013)) => {
             "The bot's role lacks a permission this needs, or the target has a role at or above the bot's highest."
-                .to_owned(),
-        ),
-        (_, Some(50035)) => Some(format!(
-            "A field of the request is wrong; errors says which. {entry} lists the fields."
-        )),
-        (_, Some(50007)) => Some("This user doesn't take direct messages from the bot.".to_owned()),
-        (_, Some(50006)) => Some("The message needs content, an embed, a sticker, a component or a file.".to_owned()),
-        (_, Some(50034)) => {
-            Some("Bulk delete only takes messages younger than 14 days; delete older ones one by one.".to_owned())
         }
-        (404, Some(10000..=10999)) => Some(
+        (_, Some(50035)) => {
+            named = format!("A field of the request is wrong; errors says which. {entry} lists the fields.");
+            &named
+        }
+        (_, Some(50007)) => "This user doesn't take direct messages from the bot.",
+        (_, Some(50006)) => "The message needs content, an embed, a sticker, a component or a file.",
+        (_, Some(50034)) => "Bulk delete only takes messages younger than 14 days; delete older ones one by one.",
+        (404, Some(10000..=10999)) => {
             "Discord knows no such thing by that id. Check the id, and that it is the kind of id this path takes."
-                .to_owned(),
-        ),
-        (403, _) => Some("The bot isn't allowed to do this here.".to_owned()),
-        (413, _) => Some("The upload is larger than this server allows.".to_owned()),
-        (400, _) => Some(format!("{entry} lists what this endpoint takes.")),
-        _ => None,
+        }
+        (403, _) => "The bot isn't allowed to do this here.",
+        (413, _) => "The upload is larger than this server allows.",
+        (400, _) => {
+            named = format!("{entry} lists what this endpoint takes.");
+            &named
+        }
+        _ => return out,
     };
-    if let Some(hint) = hint {
-        out.push('\n');
-        out.push_str(&hint);
-    }
+    out.push('\n');
+    out.push_str(hint);
     out
 }
 

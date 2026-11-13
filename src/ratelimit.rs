@@ -41,22 +41,23 @@ pub struct Observed {
 impl RateLimiter {
     /// Take a slot for a request on `route`, or learn how long to wait for one.
     pub fn claim(&self, route: &str, now: Instant) -> Result<(), Duration> {
-        let mut state = lock(&self.state);
+        let mut guard = lock(&self.state);
+        let state = &mut *guard;
         if let Some(until) = state.global_until {
             if until > now {
                 return Err(until - now);
             }
             state.global_until = None;
         }
-        let Some(id) = state.bucket_of.get(route).cloned() else {
+        let Some(id) = state.bucket_of.get(route) else {
             // Nothing known yet: the first response tells.
             return Ok(());
         };
-        let Some(bucket) = state.buckets.get_mut(&id) else {
+        let Some(bucket) = state.buckets.get_mut(id) else {
             return Ok(());
         };
         if now >= bucket.reset_at {
-            state.buckets.remove(&id);
+            state.buckets.remove(id);
             return Ok(());
         }
         if bucket.remaining == 0 {
@@ -93,15 +94,15 @@ impl RateLimiter {
         let mut state = lock(&self.state);
         let until = now + retry_after;
         if global {
-            state.global_until = Some(state.global_until.map_or(until, |u| u.max(until)));
+            // `None` orders before any time, so this keeps the later of the two.
+            state.global_until = state.global_until.max(Some(until));
             return;
         }
         let id = state
             .bucket_of
-            .get(route)
-            .cloned()
-            .unwrap_or_else(|| format!("?|{route}"));
-        state.bucket_of.insert(route.to_owned(), id.clone());
+            .entry(route.to_owned())
+            .or_insert_with(|| format!("?|{route}"))
+            .clone();
         state.buckets.insert(
             id,
             Bucket {

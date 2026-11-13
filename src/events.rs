@@ -50,6 +50,7 @@ pub struct EventLog {
     max_bytes: usize,
 }
 
+#[derive(Default)]
 struct Inner {
     events: VecDeque<Arc<Event>>,
     /// The cursor of the newest event ever logged.
@@ -66,11 +67,7 @@ impl Default for EventLog {
 impl EventLog {
     pub fn with_limits(max_events: usize, max_bytes: usize) -> Self {
         Self {
-            inner: Mutex::new(Inner {
-                events: VecDeque::new(),
-                last: 0,
-                bytes: 0,
-            }),
+            inner: Mutex::default(),
             changed: Notify::new(),
             max_events,
             max_bytes,

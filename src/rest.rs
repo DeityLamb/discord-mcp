@@ -9,6 +9,7 @@ use reqwest::multipart::{Form, Part};
 use reqwest::{Method, StatusCode};
 use serde_json::Value;
 
+use crate::filter;
 use crate::ratelimit::{Observed, RateLimiter};
 use crate::spec::encode_header;
 
@@ -101,8 +102,7 @@ impl std::fmt::Display for RestError {
 impl Rest {
     /// `token` is the bot token, with or without the `Bot ` in front.
     pub fn new(token: &str, base: &str, patience: Duration) -> Result<Self, String> {
-        let token = token.trim();
-        let token = token.strip_prefix("Bot ").unwrap_or(token).trim();
+        let token = bare_token(token);
         if token.is_empty() || token.chars().any(|c| c.is_whitespace() || c.is_control()) {
             return Err("the bot token is empty or has spaces in it".into());
         }
@@ -206,11 +206,7 @@ impl Rest {
                 }
                 (Some(Value::Object(fields)), Layout::Fields) => {
                     for (name, value) in fields {
-                        let text = match value {
-                            Value::String(s) => s.clone(),
-                            other => other.to_string(),
-                        };
-                        form = form.text(name.clone(), text);
+                        form = form.text(name.clone(), filter::plain(value));
                     }
                 }
                 _ => {}
@@ -231,6 +227,13 @@ impl Rest {
         }
         Ok(builder)
     }
+}
+
+/// The token without the `Bot ` an agent or a copied header may have put in front, and without spaces
+/// around it.
+pub fn bare_token(token: &str) -> &str {
+    let token = token.trim();
+    token.strip_prefix("Bot ").unwrap_or(token).trim()
 }
 
 fn user_agent() -> String {

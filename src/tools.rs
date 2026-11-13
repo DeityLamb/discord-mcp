@@ -207,10 +207,10 @@ fn lenient_query<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<(Stri
                     // A list is the parameter repeated.
                     Value::Array(items) => {
                         for item in items {
-                            out.push((name.clone(), plain(&item)));
+                            out.push((name.clone(), filter::plain(&item)));
                         }
                     }
-                    other => out.push((name, plain(&other))),
+                    other => out.push((name, filter::plain(&other))),
                 }
             }
         }
@@ -228,19 +228,12 @@ fn lenient_query<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<(Stri
     Ok(out)
 }
 
-fn plain(value: &Value) -> String {
-    match value {
-        Value::String(s) => s.clone(),
-        other => other.to_string(),
-    }
-}
-
 /// A list of keywords, or the one keyword an agent may send as a plain string.
 fn keyword_list<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Vec<String>>, D::Error> {
     Ok(match Option::<Value>::deserialize(deserializer)? {
         None | Some(Value::Null) => None,
         Some(Value::String(text)) => Some(vec![text]),
-        Some(Value::Array(items)) => Some(items.iter().map(plain).collect()),
+        Some(Value::Array(items)) => Some(items.iter().map(filter::plain).collect()),
         Some(_) => {
             return Err(serde::de::Error::custom(
                 "keywords must be a list of strings, like [\"ban\", \"bans\"]",

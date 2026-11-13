@@ -15,7 +15,7 @@ use twilight_gateway::{CloseFrame, ConfigBuilder, Intents, Message, MessageSende
 
 use crate::events::EventLog;
 use crate::lock;
-use crate::rest::{Body, Layout, Request, Rest};
+use crate::rest::{self, Body, Layout, Request, Rest};
 
 /// How soon after Discord closed the session for good a new one may be tried: each try spends one
 /// of the bot's 1000 daily identifies.
@@ -166,9 +166,8 @@ pub struct Gateway {
 
 impl Gateway {
     pub fn new(token: &str, rest: Arc<Rest>, intents: IntentChoice, url: Option<String>) -> Arc<Self> {
-        let token = token.trim();
         Arc::new(Self {
-            token: token.strip_prefix("Bot ").unwrap_or(token).trim().to_owned(),
+            token: rest::bare_token(token).to_owned(),
             rest,
             intents,
             url,

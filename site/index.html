@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Simple MCP for Discord</title>
+<meta name="description" content="An MCP server for Discord: the REST API, gateway events and the API reference, acting as your bot.">
+<meta name="color-scheme" content="dark">
+<style>
+body {
+  max-width: 72ch;
+  margin: 40px auto;
+  padding: 0 16px;
+  background: #161616;
+  color: #d8d8d8;
+  font: 15px/1.6 ui-monospace, "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
+}
+a { color: #9ec5ff; text-decoration: none; }
+a:hover, a:focus-visible { text-decoration: underline; }
+a:visited { color: #c9a8ff; }
+h1 { font-size: 20px; margin: 0 0 4px; }
+h2 { font-size: 15px; margin: 44px 0 10px; text-transform: uppercase; }
+p { margin: 0 0 12px; }
+pre { border-radius: 4px; font-size: 13px; color: #c8c8c8; background: #202020; padding: 10px 12px; overflow-x: auto; margin: 0 0 12px; }
+table { border-collapse: collapse; margin: 0 0 12px; }
+td { padding: 4px 0; vertical-align: baseline; border-top: 1px solid #2a2a2a; }
+tr:first-child td { border-top: 0; }
+td:first-child { padding-right: 3ch; white-space: nowrap; }
+td + td { font-size: 13px; }
+@media (max-width: 480px) { td:first-child { padding-right: 1.5ch; } }
+.dim { color: #8a8a8a; }
+code { font: inherit; font-size: 13px; white-space: nowrap; color: #c4a98a; background: #202020; padding: 1px 5px; border-radius: 3px; }
+* { scrollbar-width: thin; scrollbar-color: #444 transparent; }
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-thumb { background: #444; }
+::-webkit-scrollbar-track { background: transparent; }
+.tabs input { position: absolute; opacity: 0; }
+.tabs label { display: inline-block; font-size: 13px; border-radius: 4px 4px 0 0; padding: 2px 10px; cursor: pointer; color: #8a8a8a; }
+.tabs input:checked + label { background: #202020; color: #fff; }
+.tabs input:focus-visible + label { outline: 1px solid #9ec5ff; }
+.tabs .code { display: none; }
+.tabs pre { border-top-left-radius: 0; }
+.tabs input:nth-of-type(1):checked ~ .code:nth-of-type(1),
+.tabs input:nth-of-type(2):checked ~ .code:nth-of-type(2),
+.tabs input:nth-of-type(3):checked ~ .code:nth-of-type(3),
+.tabs input:nth-of-type(4):checked ~ .code:nth-of-type(4),
+.tabs input:nth-of-type(5):checked ~ .code:nth-of-type(5) { display: block; }
+.code { position: relative; margin: 0 0 12px; }
+.code pre { margin: 0; padding-right: 44px; }
+.copy {
+  position: absolute; top: 50%; right: 8px; transform: translateY(-50%);
+  display: grid; place-items: center; width: 26px; height: 24px; padding: 0;
+  color: #8a8a8a; background: #2a2a2a; border: 0; border-radius: 3px; cursor: pointer;
+}
+.copy svg { width: 14px; height: 14px; }
+.copy:hover { color: #d8d8d8; }
+.copy:focus-visible { outline: 1px solid #9ec5ff; }
+pre .p { color: #666; }
+pre .t { color: #e5c07b; }
+pre .k { color: #9ec5ff; }
+pre .s { color: #a8cc8c; }
+pre .n { color: #d19a66; }
+pre .o { color: #8a8a8a; }
+hr { border: 0; border-top: 1px solid #2a2a2a; margin: 44px 0 12px; }
+hr.step { margin: 12px 0; }
+</style>
+</head>
+<body>
+
+<h1>Simple MCP for Discord</h1>
+<p class="dim"><code>discord-mcp</code> gives your agent Discord's REST API, gateway events and API
+reference, and acts as your bot.</p>
+<p><a href="https://github.com/DeityLamb/discord-mcp">GitHub</a> | <a href="https://github.com/DeityLamb/discord-mcp/releases">Releases</a></p>
+
+<h2>Install</h2>
+<p>One binary, nothing else to set up.</p>
+<div class="tabs">
+  <input type="radio" name="os" id="tab-cargo" checked><label for="tab-cargo">cargo</label>
+  <input type="radio" name="os" id="tab-linux"><label for="tab-linux">linux</label>
+  <input type="radio" name="os" id="tab-macos"><label for="tab-macos">macos</label>
+  <input type="radio" name="os" id="tab-windows"><label for="tab-windows">windows</label>
+<div class="code"><pre><span class="t">cargo</span> binstall discord-mcp</pre></div>
+<div class="code"><pre><span class="t">curl</span> -fsSL https://raw.githubusercontent.com/DeityLamb/discord-mcp/main/install.sh | <span class="t">sh</span></pre></div>
+<div class="code"><pre><span class="t">curl</span> -fsSL https://raw.githubusercontent.com/DeityLamb/discord-mcp/main/install.sh | <span class="t">sh</span></pre></div>
+<div class="code"><pre><span class="t">irm</span> https://raw.githubusercontent.com/DeityLamb/discord-mcp/main/install.ps1 | <span class="t">iex</span></pre></div>
+</div>
+
+<h2>Set up</h2>
+<p>Create a bot in the Developer Portal and copy its token.</p>
+<p><a href="https://discord.com/developers/applications" target="_blank" rel="noopener">Discord Developer Portal</a></p>
+<hr class="step">
+<p>Invite it with this link (the ID is on General Information).</p>
+<div class="code"><pre>https://discord.com/oauth2/authorize?client_id=<span class="n">&lt;id&gt;</span>&amp;scope=bot&amp;permissions=0</pre></div>
+<hr class="step">
+<p>Add it to your agent with the token.</p>
+<div class="tabs">
+  <input type="radio" name="client" id="client-code" checked><label for="client-code">claude code</label>
+  <input type="radio" name="client" id="client-desktop"><label for="client-desktop">claude desktop</label>
+  <input type="radio" name="client" id="client-codex"><label for="client-codex">codex</label>
+  <input type="radio" name="client" id="client-pi"><label for="client-pi">pi</label>
+  <input type="radio" name="client" id="client-json"><label for="client-json">other</label>
+<div class="code"><pre><span class="t">claude</span> mcp add discord -s user -e DISCORD_TOKEN=<span class="n">&lt;token&gt;</span> -- discord-mcp</pre></div>
+<div class="code"><pre><span class="o">// claude_desktop_config.json</span>
+{
+  "mcpServers": {
+    "discord": {
+      "command": "discord-mcp",
+      "env": { "DISCORD_TOKEN": "<span class="n">&lt;token&gt;</span>" }
+    }
+  }
+}</pre></div>
+<div class="code"><pre><span class="t">codex</span> mcp add discord --env DISCORD_TOKEN=<span class="n">&lt;token&gt;</span> -- discord-mcp</pre></div>
+<div class="code"><pre><span class="t">pi</span> mcp add discord --env DISCORD_TOKEN=<span class="n">&lt;token&gt;</span> -- discord-mcp</pre></div>
+<div class="code"><pre><span class="o">// or just send this page to your agent</span>
+{
+  "mcpServers": {
+    "discord": {
+      "command": "discord-mcp",
+      "env": { "DISCORD_TOKEN": "<span class="n">&lt;token&gt;</span>" }
+    }
+  }
+}</pre></div>
+</div>
+
+<h2>Tools</h2>
+<p><code>discord_get</code> and <code>discord_call</code> take any API path, so there is no tool per endpoint.
+Every call can take a <code>jq</code> filter to shorten the answer.</p>
+<table>
+  <tr><td><code>discord_docs</code></td><td>API reference from Discord's OpenAPI spec, updated daily.</td></tr>
+  <tr><td><code>discord_get</code></td><td>GET requests: servers, channels, messages, members, roles.</td></tr>
+  <tr><td><code>discord_call</code></td><td>POST, PUT, PATCH, DELETE: send, edit, moderate, upload.</td></tr>
+  <tr><td><code>discord_events</code></td><td>Gateway events as they arrive: messages, reactions, joins.</td></tr>
+  <tr><td><code>discord_gateway</code></td><td>The bot's status and activity, and member lookups.</td></tr>
+</table>
+
+<h2>Example</h2>
+<p>Asked to open a thread for release notes and wait for a reply.</p>
+<pre><span class="p">&gt;</span> <span class="t">discord_docs</span> {
+    <span class="k">"keywords"</span>: [<span class="s">"thread"</span>, <span class="s">"threads"</span>]
+  }
+<span class="o">POST /channels/{channel_id}/threads — create_thread</span>
+<span class="o">…</span>
+
+<span class="p">&gt;</span> <span class="t">discord_call</span> {
+    <span class="k">"method"</span>: <span class="s">"POST"</span>,
+    <span class="k">"path"</span>: <span class="s">"/channels/1290…/threads"</span>,
+    <span class="k">"body"</span>: { <span class="k">"name"</span>: <span class="s">"Release notes"</span> },
+    <span class="k">"jq"</span>: <span class="s">".id"</span>
+  }
+<span class="o">"1301…"</span>
+
+<span class="p">&gt;</span> <span class="t">discord_events</span> {
+    <span class="k">"types"</span>: [<span class="s">"MESSAGE_CREATE"</span>],
+    <span class="k">"wait"</span>: 300,
+    <span class="k">"jq"</span>: <span class="s">"{author: .author.username, content}"</span>
+  }
+<span class="o">#815 MESSAGE_CREATE {"author":"ann","content":"looks good"}</span></pre>
+
+<hr>
+<p class="dim">GPL-3.0-or-later. Not affiliated with Discord.</p>
+
+<script>
+// A copy button on each code block. JSON loses its "// …" comment line, so it pastes as valid JSON.
+const icon = (path) =>
+  `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${path}</svg>`;
+const COPY = icon('<rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/>');
+const DONE = icon('<path d="M5 12l5 5L20 7"/>');
+const FAILED = icon('<path d="M6 6l12 12M18 6L6 18"/>');
+for (const block of document.querySelectorAll(".code")) {
+  const button = document.createElement("button");
+  button.className = "copy";
+  button.type = "button";
+  button.title = "Copy";
+  button.setAttribute("aria-label", "Copy");
+  button.innerHTML = COPY;
+  button.addEventListener("click", async () => {
+    const text = block.querySelector("pre").textContent.replace(/^\/\/.*\n/, "");
+    try {
+      await navigator.clipboard.writeText(text);
+      button.innerHTML = DONE;
+      button.setAttribute("aria-label", "Copied");
+    } catch {
+      button.innerHTML = FAILED;
+      button.setAttribute("aria-label", "Couldn't copy");
+    }
+    setTimeout(() => {
+      button.innerHTML = COPY;
+      button.setAttribute("aria-label", "Copy");
+    }, 1500);
+  });
+  block.append(button);
+}
+</script>
+</body>
+</html>

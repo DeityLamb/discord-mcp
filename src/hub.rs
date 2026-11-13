@@ -21,6 +21,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 
+use crate::env_dir;
 use crate::gateway::Gateway;
 use crate::mcp::DiscordServer;
 use crate::rest::Rest;
@@ -75,18 +76,17 @@ pub enum Outcome {
 
 /// `DISCORD_MCP_STATE_DIR`, or the per-user directory hubs keep their files in.
 pub fn state_dir() -> Option<PathBuf> {
-    let var = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty()).map(PathBuf::from);
-    if let Some(dir) = var("DISCORD_MCP_STATE_DIR") {
+    if let Some(dir) = env_dir("DISCORD_MCP_STATE_DIR") {
         return Some(dir);
     }
     if cfg!(windows) {
-        return var("LOCALAPPDATA").map(|d| d.join("discord-mcp"));
+        return env_dir("LOCALAPPDATA").map(|d| d.join("discord-mcp"));
     }
     if cfg!(target_os = "macos") {
         return std::env::home_dir().map(|h| h.join("Library").join("Application Support").join("discord-mcp"));
     }
-    var("XDG_RUNTIME_DIR")
-        .or_else(|| var("XDG_STATE_HOME"))
+    env_dir("XDG_RUNTIME_DIR")
+        .or_else(|| env_dir("XDG_STATE_HOME"))
         .or_else(|| std::env::home_dir().map(|h| h.join(".local").join("state")))
         .map(|d| d.join("discord-mcp"))
 }

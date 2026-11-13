@@ -28,6 +28,9 @@ pub const GATEWAY: &str = "discord_gateway";
 const MAX_FILES: usize = 10;
 /// Time a filter gets beyond its own limit before the call stops waiting for it.
 const JQ_GRACE: Duration = Duration::from_secs(2);
+/// What a caller hears of a filter that outran [`JQ_GRACE`], and the same after a request that went out.
+const JQ_ABANDONED: &str = "jq filter ran too long and was abandoned.";
+const JQ_ABANDONED_AFTER_REQUEST: &str = "jq filter ran too long and was abandoned; the request itself went through.";
 /// Events one discord_events call returns unless told otherwise, and at most.
 const DEFAULT_EVENTS: u32 = 50;
 const MAX_EVENTS: u32 = 500;
@@ -380,14 +383,15 @@ impl Tools {
             }
             GatewayOp::RequestGuildMembers => {
                 let members = gateway.request_members(data).await?;
-                self.shape(members, args.jq).await
+                self.shape(members, args.jq, JQ_ABANDONED).await
             }
         }
     }
 
-    /// JSON for the answer: compact, or through the caller's jq filter.
-    async fn shape(&self, value: Value, jq: Option<String>) -> Result<String, String> {
-        let Some(program) = jq.filter(|f| !f.trim().is_empty()) else {
+    /// JSON for the answer: compact, or through the caller's jq filter. `abandoned` is the error for a
+    /// filter that outruns its clock.
+    async fn shape(&self, value: Value, jq: Option<String>, abandoned: &str) -> Result<String, String> {
+        let Some(program) = given(jq) else {
             return Ok(filter::compact(&value));
         };
         let max = self.options.max_output;
@@ -396,7 +400,7 @@ impl Tools {
         match tokio::time::timeout(filter::JQ_TIMEOUT + JQ_GRACE, run).await {
             Ok(Ok(result)) => result,
             Ok(Err(e)) => Err(format!("jq filter crashed: {e}")),
-            Err(_) => Err("jq filter ran too long and was abandoned.".into()),
+            Err(_) => Err(abandoned.into()),
         }
     }
 
@@ -411,8 +415,8 @@ impl Tools {
         }
         let query = Arc::new(Query {
             types: args.types.iter().map(|t| t.trim().to_ascii_uppercase()).collect(),
-            condition: args.filter.filter(|f| !f.trim().is_empty()),
-            shape: args.jq.filter(|f| !f.trim().is_empty()),
+            condition: given(args.filter),
+            shape: given(args.jq),
             limit: args.limit.unwrap_or(DEFAULT_EVENTS).clamp(1, MAX_EVENTS) as usize,
             max_chars: self.options.max_output,
         });
@@ -565,7 +569,7 @@ impl Tools {
             body: wanted.body,
             files,
             layout,
-            reason: wanted.reason.filter(|r| !r.trim().is_empty()),
+            reason: given(wanted.reason),
         };
         let response = rest.send(&request).await.map_err(|e| e.to_string())?;
         let answer = self.present(response, wanted.jq, operation).await;
@@ -668,23 +672,7 @@ impl Tools {
             ),
             Body::Text(text) => text,
             Body::Binary { content_type, bytes } => format!("{content_type}, {bytes} bytes (not shown)."),
-            Body::Json(value) => match jq.filter(|f| !f.trim().is_empty()) {
-                None => filter::compact(&value),
-                Some(program) => {
-                    let max = self.options.max_output;
-                    // A filter is someone else's program: it runs off the async threads and under a clock.
-                    let run = tokio::task::spawn_blocking(move || filter::jq(&program, &value, max));
-                    match tokio::time::timeout(filter::JQ_TIMEOUT + JQ_GRACE, run).await {
-                        Ok(Ok(result)) => result?,
-                        Ok(Err(e)) => return Err(format!("jq filter crashed: {e}")),
-                        Err(_) => {
-                            return Err(
-                                "jq filter ran too long and was abandoned; the request itself went through.".into(),
-                            );
-                        }
-                    }
-                }
-            },
+            Body::Json(value) => self.shape(value, jq, JQ_ABANDONED_AFTER_REQUEST).await?,
         };
         Ok(text + &waited)
     }
@@ -731,6 +719,11 @@ impl From<CallArgs> for Wanted {
 
 fn non_empty(text: &Option<String>) -> Option<&str> {
     text.as_deref().map(str::trim).filter(|t| !t.is_empty())
+}
+
+/// An optional argument, with a blank one counted as not given.
+fn given(text: Option<String>) -> Option<String> {
+    text.filter(|t| !t.trim().is_empty())
 }
 
 fn parse<T: DeserializeOwned>(args: Value) -> Result<T, String> {

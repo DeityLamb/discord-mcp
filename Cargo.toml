@@ -1,12 +1,13 @@
 [package]
 name = "discord-mcp"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.89"
 description = "MCP server for Discord: the whole REST API through one passthrough, with the API reference built in"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/DeityLamb/discord-mcp"
 readme = "README.md"
+exclude = [".github", "site", "install.sh", "install.ps1", "release-plz.toml"]
 keywords = ["mcp", "discord", "llm", "bot", "ai"]
 categories = ["command-line-utilities"]
 

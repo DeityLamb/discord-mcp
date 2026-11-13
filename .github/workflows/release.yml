@@ -1,10 +1,20 @@
 name: Release
 
-# Push a tag like v0.1.0 to build binaries for every platform and attach them to a GitHub release.
+# Builds the binaries for every platform and attaches them to a release. release-plz calls it once it
+# has published a version and made its tag and GitHub release (a tag it pushes can't start a workflow
+# by itself). Run it by hand with a tag to rebuild one release's binaries.
 
 on:
-  push:
-    tags: ["v*"]
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "The release to build, e.g. v0.2.0"
+        required: true
 
 permissions:
   contents: write
@@ -26,8 +36,12 @@ jobs:
           - { target: x86_64-pc-windows-msvc, os: windows-latest }
           - { target: aarch64-pc-windows-msvc, os: windows-11-arm }
     runs-on: ${{ matrix.os }}
+    env:
+      TAG: ${{ inputs.tag }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -38,7 +52,7 @@ jobs:
       - name: Package
         shell: bash
         run: |
-          name=discord-mcp-${GITHUB_REF_NAME}-${{ matrix.target }}
+          name=discord-mcp-${TAG}-${{ matrix.target }}
           mkdir "$name"
           cp README.md LICENSE "$name/"
           if [[ "${{ matrix.target }}" == *windows* ]]; then
@@ -55,8 +69,8 @@ jobs:
           name: ${{ matrix.target }}
           path: ${{ env.ASSET }}
 
-  release:
-    name: Publish release
+  upload:
+    name: Attach to the release
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -66,6 +80,7 @@ jobs:
           merge-multiple: true
       - name: Checksums
         run: cd dist && sha256sum * > SHA256SUMS
+      # release-plz made the release with its changelog; this adds the files. --clobber: a rerun replaces them.
       - env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
+        run: gh release upload "${{ inputs.tag }}" dist/* --repo "$GITHUB_REPOSITORY" --clobber

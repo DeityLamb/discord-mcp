@@ -10,6 +10,7 @@ use serde_json::{Map, Value, json};
 use tokio::sync::Notify;
 
 use crate::filter::Program;
+use crate::lock;
 
 /// Events kept; the oldest go first.
 pub const MAX_EVENTS: usize = 5_000;
@@ -84,7 +85,7 @@ impl EventLog {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         {
-            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let mut inner = lock(&self.inner);
             inner.last += 1;
             let event = Event {
                 seq: inner.last,
@@ -106,12 +107,12 @@ impl EventLog {
 
     /// The cursor of the newest event: pass it as `after` to see only what comes later.
     pub fn cursor(&self) -> u64 {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).last
+        lock(&self.inner).last
     }
 
     /// Events after the cursor, oldest first, and how many after it are gone from the log.
     pub fn since(&self, after: u64) -> (Vec<Arc<Event>>, u64) {
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let inner = lock(&self.inner);
         let oldest = inner.events.front().map_or(inner.last + 1, |e| e.seq);
         let missed = oldest.saturating_sub(after + 1);
         let events = inner.events.iter().filter(|e| e.seq > after).cloned().collect();

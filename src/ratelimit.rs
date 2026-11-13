@@ -6,6 +6,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use crate::lock;
+
 #[derive(Default)]
 pub struct RateLimiter {
     state: Mutex<State>,
@@ -39,7 +41,7 @@ pub struct Observed {
 impl RateLimiter {
     /// Take a slot for a request on `route`, or learn how long to wait for one.
     pub fn claim(&self, route: &str, now: Instant) -> Result<(), Duration> {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = lock(&self.state);
         if let Some(until) = state.global_until {
             if until > now {
                 return Err(until - now);
@@ -72,7 +74,7 @@ impl RateLimiter {
         };
         // Routes sharing a bucket still count separately per major parameter, which the route key carries.
         let id = format!("{bucket}|{}", major(route));
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = lock(&self.state);
         state.bucket_of.insert(route.to_owned(), id.clone());
         let reset_at = now + Duration::from_secs_f64(reset_after.max(0.0));
         match state.buckets.get_mut(&id) {
@@ -88,7 +90,7 @@ impl RateLimiter {
 
     /// Record a 429: nothing on `route` (or anywhere, when `global`) for `retry_after`.
     pub fn limited(&self, route: &str, retry_after: Duration, global: bool, now: Instant) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = lock(&self.state);
         let until = now + retry_after;
         if global {
             state.global_until = Some(state.global_until.map_or(until, |u| u.max(until)));

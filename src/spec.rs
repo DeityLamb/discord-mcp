@@ -10,6 +10,8 @@ use std::time::Duration;
 use serde_json::Value;
 use tokio::sync::Notify;
 
+use crate::lock;
+
 /// The spec in use: from the cache, or just downloaded. `None` until one is loaded.
 static CURRENT: RwLock<Option<Arc<Spec>>> = RwLock::new(None);
 /// Why there is no spec, once getting one has failed.
@@ -24,13 +26,13 @@ pub fn current() -> Option<Arc<Spec>> {
 /// Put a spec (from the cache or just fetched) in use.
 pub fn replace(spec: Spec) {
     *CURRENT.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(spec));
-    *MISSING.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *lock(&MISSING) = None;
     CHANGED.notify_waiters();
 }
 
 /// Say that no spec is coming, and why: whoever waits for one hears it at once.
 pub fn unavailable(why: String) {
-    *MISSING.lock().unwrap_or_else(|e| e.into_inner()) = Some(why);
+    *lock(&MISSING) = Some(why);
     CHANGED.notify_waiters();
 }
 
@@ -44,7 +46,7 @@ pub async fn wait(patience: Duration) -> Result<Arc<Spec>, String> {
         if let Some(spec) = current() {
             return Ok(spec);
         }
-        if let Some(why) = MISSING.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        if let Some(why) = lock(&MISSING).clone() {
             return Err(why);
         }
         if tokio::time::timeout_at(deadline, changed).await.is_err() {

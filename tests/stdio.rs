@@ -7,9 +7,32 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
+/// A cache holding the spec, as after a first download, so nothing is fetched.
+fn cache() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::copy("spec/openapi.json", dir.path().join("openapi.json")).unwrap();
+    dir
+}
+
 async fn session(args: &[&str], requests: &[Value]) -> Vec<Value> {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_discord-mcp"))
+    let cache = cache();
+    session_with(args, cache.path(), None, requests).await
+}
+
+/// A session with this cache directory and, if given, this place to download the spec from.
+async fn session_with(
+    args: &[&str],
+    cache: &std::path::Path,
+    spec_url: Option<&str>,
+    requests: &[Value],
+) -> Vec<Value> {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_discord-mcp"));
+    if let Some(url) = spec_url {
+        command.env("DISCORD_MCP_SPEC_URL", url);
+    }
+    let mut child = command
         .args(args)
+        .env("DISCORD_MCP_CACHE_DIR", cache)
         .env_remove("DISCORD_TOKEN")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -99,4 +122,20 @@ async fn read_only_lists_no_write_tool() {
     let tools = answers[1]["result"]["tools"].as_array().unwrap();
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert_eq!(names, ["discord_docs", "discord_get"]);
+}
+
+#[tokio::test]
+async fn a_first_start_that_cannot_download_the_reference_says_so() {
+    let empty = tempfile::tempdir().unwrap();
+    let mut requests = hello().to_vec();
+    requests.push(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+        "name": "discord_docs", "arguments": {"keywords": ["ban"]}
+    }}));
+    // Nothing listens on port 9: the download fails at once rather than after a timeout.
+    let answers = session_with(&[], empty.path(), Some("http://127.0.0.1:9/openapi.json"), &requests).await;
+    let result = &answers[1]["result"];
+    assert_eq!(result["isError"], true);
+    let text = result["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("isn't available"), "{text}");
+    assert!(!empty.path().join("openapi.json").exists());
 }

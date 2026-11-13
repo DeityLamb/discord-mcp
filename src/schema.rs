@@ -287,11 +287,11 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::spec::EMBEDDED;
+    use crate::spec::FIXTURE;
 
     #[test]
     fn types_read_naturally() {
-        let t = |v: Value| type_expr(&EMBEDDED, &v);
+        let t = |v: Value| type_expr(&FIXTURE, &v);
         assert_eq!(t(json!({"type": ["string", "null"]})), "string | null");
         assert_eq!(t(json!({"$ref": "#/components/schemas/SnowflakeType"})), "snowflake");
         assert_eq!(t(json!({"$ref": "#/components/schemas/RichEmbed"})), "RichEmbed");
@@ -313,16 +313,16 @@ mod tests {
 
     #[test]
     fn message_body_lists_its_fields() {
-        let (name, schema) = EMBEDDED.schema("MessageCreateRequest").unwrap();
-        let text = render_named(&EMBEDDED, name, schema);
+        let (name, schema) = FIXTURE.schema("MessageCreateRequest").unwrap();
+        let text = render_named(&FIXTURE, name, schema);
         assert!(text.contains("content?: string | null (max 4000 chars)"), "{text}");
         assert!(text.contains("embeds?: RichEmbed[] | null (max 10 items)"), "{text}");
     }
 
     #[test]
     fn enums_list_their_values() {
-        let (name, schema) = EMBEDDED.schema("ChannelTypes").unwrap();
-        let text = render_named(&EMBEDDED, name, schema);
+        let (name, schema) = FIXTURE.schema("ChannelTypes").unwrap();
+        let text = render_named(&FIXTURE, name, schema);
         assert!(
             text.contains("0  GUILD_TEXT — A text channel within a server"),
             "{text}"
@@ -331,9 +331,9 @@ mod tests {
 
     #[test]
     fn upload_fields_come_from_the_spec() {
-        let op = EMBEDDED.by_id("create_message").unwrap();
-        let multipart = &op.object(&EMBEDDED)["requestBody"]["content"]["multipart/form-data"]["schema"];
-        let names = file_fields(&EMBEDDED, multipart);
+        let op = FIXTURE.by_id("create_message").unwrap();
+        let multipart = &op.object(&FIXTURE)["requestBody"]["content"]["multipart/form-data"]["schema"];
+        let names = file_fields(&FIXTURE, multipart);
         assert_eq!(names.first().map(String::as_str), Some("files[0]"));
         assert_eq!(names.len(), 10);
     }

@@ -1,28 +1,62 @@
-//! Discord's OpenAPI spec, embedded: the list of endpoints, matching a
-//! concrete path to its endpoint, and keyword search over them.
+//! Discord's OpenAPI spec: the list of endpoints, matching a concrete path
+//! to its endpoint, and finding endpoints by keyword. It is downloaded and
+//! cached (`update`), not compiled in: until the first download finishes
+//! there is none, and callers wait for it.
 
 use std::collections::HashSet;
-use std::sync::{Arc, LazyLock, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
+use std::time::Duration;
 
 use serde_json::Value;
+use tokio::sync::Notify;
 
-const RAW: &str = include_str!("../spec/openapi.json");
+/// The spec in use: from the cache, or just downloaded. `None` until one is loaded.
+static CURRENT: RwLock<Option<Arc<Spec>>> = RwLock::new(None);
+/// Why there is no spec, once getting one has failed.
+static MISSING: Mutex<Option<String>> = Mutex::new(None);
+static CHANGED: LazyLock<Notify> = LazyLock::new(Notify::new);
 
-/// The copy of the spec compiled into the binary: what a first or offline run has.
-pub static EMBEDDED: LazyLock<Arc<Spec>> =
-    LazyLock::new(|| Arc::new(Spec::parse(RAW).expect("the embedded OpenAPI spec parses")));
-
-static CURRENT: LazyLock<RwLock<Arc<Spec>>> = LazyLock::new(|| RwLock::new(EMBEDDED.clone()));
-
-/// The spec in use: the embedded copy until a newer one is loaded.
-pub fn current() -> Arc<Spec> {
+/// The spec in use, if one is loaded.
+pub fn current() -> Option<Arc<Spec>> {
     CURRENT.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
-/// Put a newer spec (from the cache or just fetched) in use.
+/// Put a spec (from the cache or just fetched) in use.
 pub fn replace(spec: Spec) {
-    *CURRENT.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(spec);
+    *CURRENT.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(spec));
+    *MISSING.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    CHANGED.notify_waiters();
 }
+
+/// Say that no spec is coming, and why: whoever waits for one hears it at once.
+pub fn unavailable(why: String) {
+    *MISSING.lock().unwrap_or_else(|e| e.into_inner()) = Some(why);
+    CHANGED.notify_waiters();
+}
+
+/// The spec in use, waiting up to `patience` for the first download. An error says why there is none.
+pub async fn wait(patience: Duration) -> Result<Arc<Spec>, String> {
+    let deadline = tokio::time::Instant::now() + patience;
+    loop {
+        let changed = CHANGED.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        if let Some(spec) = current() {
+            return Ok(spec);
+        }
+        if let Some(why) = MISSING.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            return Err(why);
+        }
+        if tokio::time::timeout_at(deadline, changed).await.is_err() {
+            return Err("it is still downloading".into());
+        }
+    }
+}
+
+/// The copy in the repository, for tests: what the cache holds after a download.
+#[cfg(test)]
+pub static FIXTURE: LazyLock<Spec> =
+    LazyLock::new(|| Spec::parse(include_str!("../spec/openapi.json")).expect("the spec in the repository parses"));
 
 pub const METHODS: [&str; 5] = ["GET", "POST", "PUT", "PATCH", "DELETE"];
 
@@ -439,7 +473,7 @@ mod tests {
     use super::*;
 
     fn found(method: &str, path: &str) -> &'static Operation {
-        match EMBEDDED.route(method, path) {
+        match FIXTURE.route(method, path) {
             Route::Found(op) => op,
             Route::WrongMethod { path, allowed } => panic!("wrong method on {path}: {allowed:?}"),
             Route::Unknown { .. } => panic!("unknown route {method} {path}"),
@@ -448,8 +482,8 @@ mod tests {
 
     #[test]
     fn spec_has_the_endpoints() {
-        assert!(EMBEDDED.ops.len() >= 200, "{} operations", EMBEDDED.ops.len());
-        assert!(EMBEDDED.by_id("create_message").is_some());
+        assert!(FIXTURE.ops.len() >= 200, "{} operations", FIXTURE.ops.len());
+        assert!(FIXTURE.by_id("create_message").is_some());
     }
 
     #[test]
@@ -467,7 +501,7 @@ mod tests {
 
     #[test]
     fn wrong_method_names_the_allowed_ones() {
-        match EMBEDDED.route("POST", "/users/@me") {
+        match FIXTURE.route("POST", "/users/@me") {
             Route::WrongMethod { path, allowed } => {
                 assert_eq!(path, "/users/@me");
                 assert_eq!(allowed, ["GET", "PATCH"]);
@@ -478,7 +512,7 @@ mod tests {
 
     #[test]
     fn unknown_route_suggests_neighbours() {
-        match EMBEDDED.route("GET", "/guilds/1/memberz") {
+        match FIXTURE.route("GET", "/guilds/1/memberz") {
             Route::Unknown { nearest } => {
                 assert_eq!(nearest[0].path, "/guilds/{guild_id}/members");
                 assert!(nearest.iter().all(|op| op.path.starts_with("/guilds/")));
@@ -500,7 +534,7 @@ mod tests {
     fn keywords_match_names_paths_and_descriptions_as_written() {
         let ids = |keywords: &[&str]| {
             let keywords: Vec<String> = keywords.iter().map(|k| k.to_string()).collect();
-            EMBEDDED
+            FIXTURE
                 .find(&keywords)
                 .iter()
                 .map(|(op, _)| op.id.clone())
@@ -517,7 +551,7 @@ mod tests {
         let both = ids(&["ban", "guild"]);
         assert!(both.iter().position(|id| id == "ban_user_from_guild") < both.iter().position(|id| id == "get_guild"));
         assert!(ids(&["zzzz"]).is_empty());
-        assert_eq!(ids(&[]).len(), EMBEDDED.ops.len());
+        assert_eq!(ids(&[]).len(), FIXTURE.ops.len());
     }
 
     #[test]

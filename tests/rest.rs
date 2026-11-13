@@ -128,7 +128,7 @@ async fn handle(State(mock): State<Arc<Mock>>, request: Request) -> Response {
                 return StatusCode::NOT_MODIFIED.into_response();
             }
             // Discord's spec plus one endpoint it doesn't have yet.
-            let mut doc = spec::EMBEDDED.doc.clone();
+            let mut doc: Value = serde_json::from_str(SPEC).unwrap();
             doc["paths"]["/fresh-endpoint"] = json!({"get": {"operationId": "get_fresh_endpoint", "responses": {}}});
             ([("etag", "\"v1\"")], axum::Json(doc)).into_response()
         }
@@ -159,7 +159,18 @@ fn options() -> Options {
     }
 }
 
+/// The spec in the repository: what the cache holds after a download.
+const SPEC: &str = include_str!("../spec/openapi.json");
+
+/// The reference in use, as after a first download. Every test shares it; a test may put a newer one in use.
+fn reference() {
+    if spec::current().is_none() {
+        spec::replace(spec::Spec::parse(SPEC).unwrap());
+    }
+}
+
 fn tools(base: &str, patience: Duration, options: Options) -> Tools {
+    reference();
     Tools {
         rest: Some(Arc::new(Rest::new("tok", base, patience).unwrap())),
         gateway: None,
@@ -461,37 +472,24 @@ async fn the_reference_is_fetched_cached_and_swapped_in() {
     let (mock, base) = discord().await;
     let cache = tempfile::tempdir().unwrap();
     let url = format!("{base}/spec.json");
-    assert!(matches!(
-        spec::current().route("GET", "/fresh-endpoint"),
-        spec::Route::Unknown { .. }
-    ));
     let first = update::refresh(cache.path(), &url).await.unwrap();
     assert!(
         matches!(first, update::Refresh::Updated { operations } if operations > 200),
         "{first:?}"
     );
     assert!(matches!(
-        spec::current().route("GET", "/fresh-endpoint"),
+        spec::current().unwrap().route("GET", "/fresh-endpoint"),
         spec::Route::Found(_)
     ));
     assert!(cache.path().join("openapi.json").is_file());
     // The bot token is for Discord alone.
     assert_eq!(mock.last().header("authorization"), "");
-    // Asked a moment ago: nothing is sent.
-    assert_eq!(
-        update::refresh(cache.path(), &url).await.unwrap(),
-        update::Refresh::Fresh
-    );
-    assert_eq!(mock.hits("GET /spec.json"), 1);
-    // A day later the repository is asked, and says nothing changed.
-    let meta = cache.path().join("openapi.meta.json");
-    let mut stale: Value = serde_json::from_slice(&std::fs::read(&meta).unwrap()).unwrap();
-    stale["checked"] = json!(0);
-    std::fs::write(&meta, stale.to_string()).unwrap();
+    // The next start asks again with the ETag, and an unchanged spec comes back as a bodiless 304.
     assert_eq!(
         update::refresh(cache.path(), &url).await.unwrap(),
         update::Refresh::Unchanged
     );
+    assert_eq!(mock.hits("GET /spec.json"), 2);
     assert_eq!(mock.last().header("if-none-match"), "\"v1\"");
     // A later start reads the cache.
     assert!(update::load_cached(cache.path()));

@@ -1,10 +1,11 @@
-//! Keeping the API reference current: the spec is fetched from Discord's
-//! repository at most once a day and kept in the cache directory. The copy
-//! compiled into the binary is what a first or offline run uses.
+//! The API reference: Discord's spec, downloaded from its repository on the
+//! first start and kept in the cache directory. Every later start uses the
+//! cache at once and asks the repository whether it changed, sending the
+//! cached copy's ETag: an unchanged spec costs a 304 with no body.
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use reqwest::StatusCode;
 use reqwest::header::{ETAG, IF_NONE_MATCH};
@@ -13,8 +14,6 @@ use serde::{Deserialize, Serialize};
 use crate::spec::{self, Spec};
 
 pub const SPEC_URL: &str = "https://raw.githubusercontent.com/discord/discord-api-spec/main/specs/openapi.json";
-/// How long a fetched spec is used before asking whether there's a newer one.
-const MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const TIMEOUT: Duration = Duration::from_secs(30);
 /// The spec is about 1.2 MB; anything far past that isn't it.
 const MAX_BYTES: usize = 16 * 1024 * 1024;
@@ -28,14 +27,10 @@ const META_FILE: &str = "openapi.meta.json";
 struct Meta {
     /// The `ETag` the cached spec came with.
     etag: Option<String>,
-    /// When the repository was last asked, in seconds since the epoch.
-    checked: u64,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Refresh {
-    /// Asked within the last day; nothing was sent.
-    Fresh,
     /// The repository has what the cache has.
     Unchanged,
     /// A newer spec is in use and in the cache.
@@ -84,13 +79,6 @@ fn checked(raw: &str) -> Result<Spec, String> {
     Ok(parsed)
 }
 
-fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 fn read_meta(dir: &Path) -> Meta {
     std::fs::read(dir.join(META_FILE))
         .ok()
@@ -106,13 +94,11 @@ fn write_atomic(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
     std::fs::rename(&tmp, dir.join(name))
 }
 
-/// Ask the repository for a newer spec if the last time was over a day ago.
+/// Ask the repository for the spec, or whether the cached one changed: with the cached copy's ETag the
+/// answer to "no" is a 304 and nothing more. Puts a new spec in use and in the cache.
 pub async fn refresh(dir: &Path, url: &str) -> Result<Refresh, String> {
     let meta = read_meta(dir);
     let have_spec = dir.join(SPEC_FILE).is_file();
-    if have_spec && now().saturating_sub(meta.checked) < MAX_AGE.as_secs() {
-        return Ok(Refresh::Fresh);
-    }
     // Its own client: the bot token never goes anywhere but Discord.
     let http = reqwest::Client::builder()
         .user_agent(concat!("discord-mcp/", env!("CARGO_PKG_VERSION")))
@@ -124,13 +110,7 @@ pub async fn refresh(dir: &Path, url: &str) -> Result<Refresh, String> {
         request = request.header(IF_NONE_MATCH, etag);
     }
     let response = request.send().await.map_err(|e| format!("fetching {url}: {e}"))?;
-    let checked_now = |etag: Option<String>| {
-        let meta = Meta { etag, checked: now() };
-        let bytes = serde_json::to_vec(&meta).unwrap_or_default();
-        write_atomic(dir, META_FILE, &bytes).map_err(|e| format!("writing {}: {e}", dir.display()))
-    };
     if response.status() == StatusCode::NOT_MODIFIED {
-        checked_now(meta.etag)?;
         return Ok(Refresh::Unchanged);
     }
     if !response.status().is_success() {
@@ -149,22 +129,36 @@ pub async fn refresh(dir: &Path, url: &str) -> Result<Refresh, String> {
     let parsed = checked(raw).map_err(|why| format!("{url} isn't a usable spec: {why}"))?;
     let operations = parsed.ops.len();
     write_atomic(dir, SPEC_FILE, &bytes).map_err(|e| format!("writing {}: {e}", dir.display()))?;
-    checked_now(etag)?;
+    let meta = serde_json::to_vec(&Meta { etag }).unwrap_or_default();
+    write_atomic(dir, META_FILE, &meta).map_err(|e| format!("writing {}: {e}", dir.display()))?;
     spec::replace(parsed);
     Ok(Refresh::Updated { operations })
 }
 
-/// Use the cache now and refresh it behind the scenes. Failures are logged and otherwise ignored: the
-/// reference in use stays the one already loaded.
-pub fn start(dir: PathBuf, url: String) {
-    load_cached(&dir);
+/// Put the cached spec in use at once and, behind the scenes, download it if there is none or (unless
+/// `update` is false) ask whether it changed. Failures are logged; with nothing cached, whoever waits
+/// for the spec is told why there is none.
+pub fn start(dir: PathBuf, url: String, update: bool) {
+    let cached = load_cached(&dir);
+    if cached && !update {
+        return;
+    }
+    if !cached {
+        // A cache that didn't load can't be what an ETag vouches for.
+        let _ = std::fs::remove_file(dir.join(META_FILE));
+    }
     tokio::spawn(async move {
         match refresh(&dir, &url).await {
             Ok(Refresh::Updated { operations }) => {
-                tracing::info!("API reference updated from {url}: {operations} endpoints")
+                tracing::info!("API reference downloaded from {url}: {operations} endpoints")
             }
-            Ok(_) => {}
-            Err(why) => tracing::warn!("API reference not updated: {why}"),
+            Ok(Refresh::Unchanged) => {}
+            Err(why) => {
+                tracing::warn!("API reference not downloaded: {why}");
+                if !cached {
+                    spec::unavailable(why);
+                }
+            }
         }
     });
 }

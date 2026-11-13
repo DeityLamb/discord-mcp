@@ -72,7 +72,7 @@ members, **Server Members Intent**.
 
 | Tool | |
 | --- | --- |
-| `discord_docs` | API reference from Discord's OpenAPI spec, updated daily. |
+| `discord_docs` | API reference from Discord's OpenAPI spec, kept up to date. |
 | `discord_get` | GET requests: servers, channels, messages, members, roles. |
 | `discord_call` | POST, PUT, PATCH, DELETE: send, edit, moderate, upload. |
 | `discord_events` | Gateway events as they arrive: messages, reactions, joins. |
@@ -114,10 +114,17 @@ POST /channels/{channel_id}/threads — create_thread
 | `--intents <list>` | Gateway intents, e.g. `guilds,guild_messages,message_content`. Default: everything but typing and presences, plus the privileged ones switched on for the bot. |
 | `--no-hub` | Keep the gateway in this process instead of sharing it. |
 | `--allow-unlisted` | Allow paths the API reference doesn't list. |
-| `--no-spec-update` | Use the built-in API reference only. |
+| `--no-spec-update` | Keep the downloaded API reference; don't check it for changes. |
 | `--max-output <chars>` | Longest answer of one call (default 40000). |
 
 `discord-mcp call <tool> '<json>'` runs one call from a shell.
+
+## The API reference
+
+`discord_docs` and the path checks of `discord_get` and `discord_call` use
+[Discord's OpenAPI spec](https://github.com/discord/discord-api-spec). It is downloaded on the first start
+(about a second) and cached; every later start uses the cache and asks GitHub whether it changed, which costs
+a bodiless 304 when it hasn't. If it can't be downloaded, requests still go to Discord, unchecked.
 
 ## Several agents, one bot
 
@@ -150,5 +157,6 @@ version and changelog, told from [conventional commits](https://www.conventional
 
 ## License
 
-GPL-3.0-or-later. The bundled `spec/openapi.json` is Discord's, under the MIT license in `spec/LICENSE`.
+GPL-3.0-or-later. `spec/openapi.json`, the copy of the API reference the tests use, is Discord's, under the MIT
+license in `spec/LICENSE`.
 Not affiliated with Discord.

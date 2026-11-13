@@ -38,7 +38,7 @@ struct Cli {
     /// Also send requests to paths the API reference doesn't list.
     #[arg(long, global = true)]
     allow_unlisted: bool,
-    /// Use the API reference compiled into this binary; never fetch a newer one.
+    /// Keep the cached API reference: download it once, then never check for a newer one.
     #[arg(long, global = true)]
     no_spec_update: bool,
     /// Most characters one tool call returns.
@@ -158,22 +158,12 @@ fn tools(cli: &Cli, setup: &Setup) -> Result<Tools, String> {
     })
 }
 
-/// Load the cached API reference and, unless told not to, look for a newer one behind the scenes.
-fn reference(cli: &Cli, refresh: bool) {
-    if cli.no_spec_update {
-        return;
-    }
-    let Some(dir) = update::cache_dir() else {
-        return;
-    };
-    if refresh {
-        update::start(
-            dir,
-            env("DISCORD_MCP_SPEC_URL").unwrap_or_else(|| update::SPEC_URL.into()),
-        );
-    } else {
-        update::load_cached(&dir);
-    }
+/// Put the cached API reference in use and fetch it behind the scenes: the first time, or (unless
+/// `--no-spec-update`) to see whether it changed.
+fn reference(cli: &Cli) {
+    let dir = update::cache_dir().unwrap_or_else(|| std::env::temp_dir().join("discord-mcp"));
+    let url = env("DISCORD_MCP_SPEC_URL").unwrap_or_else(|| update::SPEC_URL.into());
+    update::start(dir, url, !cli.no_spec_update);
 }
 
 /// Which hub the sessions of this bot share. A rebuilt or upgraded binary gets a hub of its own
@@ -220,7 +210,7 @@ async fn serve(cli: &Cli) -> Result<ExitCode, String> {
         tools: tools(cli, &setup)?,
     };
     let gateway = server.tools.gateway.clone();
-    reference(cli, true);
+    reference(cli);
     let service = server
         .serve(rmcp::transport::stdio())
         .await
@@ -260,7 +250,7 @@ async fn be_hub(cli: &Cli, key: &str) -> Result<ExitCode, String> {
     let grace = env("DISCORD_MCP_HUB_GRACE")
         .and_then(|s| s.parse().ok())
         .map_or(hub::IDLE_GRACE, Duration::from_secs_f64);
-    reference(cli, true);
+    reference(cli);
     let shared = hub::Shared {
         rest,
         gateway: tools.gateway,
@@ -328,7 +318,7 @@ async fn call(cli: &Cli, list: bool, tool: Option<&str>, args: Option<String>) -
             Err(e) => return Err(format!("json-args is not valid JSON: {e}")),
         },
     };
-    reference(cli, false);
+    reference(cli);
     let result = tools.call(tool, args).await;
     if let Some(gateway) = &tools.gateway {
         gateway.stop().await;

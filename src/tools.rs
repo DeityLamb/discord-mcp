@@ -33,6 +33,8 @@ const DEFAULT_EVENTS: u32 = 50;
 const MAX_EVENTS: u32 = 500;
 /// Longest one discord_events call waits, in seconds; a caller that wants longer calls again.
 const MAX_WAIT: u32 = 300;
+/// Longest a call waits for the API reference on a first start, while it downloads.
+const SPEC_WAIT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Options {
@@ -327,7 +329,10 @@ impl Tools {
     pub async fn call(&self, name: &str, args: Option<JsonObject>) -> CallToolResult {
         let args = Value::Object(args.unwrap_or_default());
         let result = match name {
-            DOCS => parse::<DocsArgs>(args).and_then(|a| self.docs(a)),
+            DOCS => match parse::<DocsArgs>(args) {
+                Ok(a) => self.docs(a).await,
+                Err(e) => Err(e),
+            },
             GET => match parse::<GetArgs>(args) {
                 Ok(a) => {
                     let wanted = Wanted {
@@ -518,8 +523,14 @@ impl Tools {
         }
     }
 
-    fn docs(&self, args: DocsArgs) -> Result<String, String> {
-        let spec = spec::current();
+    async fn docs(&self, args: DocsArgs) -> Result<String, String> {
+        let spec = spec::wait(SPEC_WAIT).await.map_err(|why| {
+            format!(
+                "The API reference isn't available: {why}. It is downloaded from \
+                 github.com/discord/discord-api-spec on first use. discord_get and discord_call still work, \
+                 without checking paths against it."
+            )
+        })?;
         let mut parts = Vec::new();
         if let Some(operation) = non_empty(&args.operation) {
             parts.push(docs::operation(&spec, operation)?);
@@ -547,12 +558,20 @@ impl Tools {
         };
         let (path, mut query) = normalize_path(&wanted.path)?;
         query.extend(wanted.query);
-        let spec = spec::current();
         let method = wanted.method.as_str().to_owned();
         let method = method.as_str();
-        let operation = match spec.route(method, &path) {
+        // Without a reference (the first download failed) the request still goes out, unchecked.
+        let (spec, unchecked) = match spec::wait(SPEC_WAIT).await {
+            Ok(spec) => (Some(spec), None),
+            Err(why) => (None, Some(why)),
+        };
+        let route = match &spec {
+            Some(spec) => spec.route(method, &path),
+            None => Route::Unknown { nearest: Vec::new() },
+        };
+        let operation = match route {
             Route::Found(operation) => Some(operation),
-            _ if self.options.allow_unlisted => None,
+            _ if self.options.allow_unlisted || spec.is_none() => None,
             Route::WrongMethod {
                 path: template,
                 allowed,
@@ -570,7 +589,7 @@ impl Tools {
             }
             Route::Unknown { nearest } => return Err(docs::unknown_route(method, &path, &nearest)),
         };
-        let (files, layout) = self.uploads(&spec, operation, wanted.files).await?;
+        let (files, layout) = self.uploads(spec.as_deref(), operation, wanted.files).await?;
         let request = Request {
             method: wanted.method,
             bucket: match operation {
@@ -585,13 +604,20 @@ impl Tools {
             reason: wanted.reason.filter(|r| !r.trim().is_empty()),
         };
         let response = rest.send(&request).await.map_err(|e| e.to_string())?;
-        self.present(response, wanted.jq, operation).await
+        let answer = self.present(response, wanted.jq, operation).await;
+        match unchecked {
+            None => answer,
+            Some(why) => {
+                let note = format!("\n(Not checked against the API reference, which isn't available: {why}.)");
+                answer.map(|a| a + &note).map_err(|e| e + &note)
+            }
+        }
     }
 
     /// Read the files to upload and decide which form fields they go in.
     async fn uploads(
         &self,
-        spec: &Spec,
+        spec: Option<&Spec>,
         operation: Option<&Operation>,
         files: Vec<FileArg>,
     ) -> Result<(Vec<FilePart>, Layout), String> {
@@ -605,7 +631,7 @@ impl Tools {
             ));
         }
         // The spec names the form fields an endpoint reads files from: files[0]… on a message, file on a sticker.
-        let fields: Option<Vec<String>> = operation.map(|operation| {
+        let fields: Option<Vec<String>> = spec.zip(operation).map(|(spec, operation)| {
             let multipart = &operation.object(spec)["requestBody"]["content"]["multipart/form-data"]["schema"];
             schema::file_fields(spec, multipart)
         });
@@ -883,6 +909,8 @@ mod tests {
 
     #[tokio::test]
     async fn docs_work_without_a_token_and_requests_say_what_is_missing() {
+        // As after the first download.
+        spec::replace(Spec::parse(include_str!("../spec/openapi.json")).unwrap());
         let tools = Tools {
             rest: None,
             gateway: None,
@@ -910,7 +938,7 @@ mod tests {
         let body = Body::Json(
             json!({"message": "Invalid Form Body", "code": 50035, "errors": {"content": {"_errors": [{"code": "BASE_TYPE_MAX_LENGTH"}]}}}),
         );
-        let message = failure(400, Some("Bad Request"), &body, spec::EMBEDDED.by_id("create_message"));
+        let message = failure(400, Some("Bad Request"), &body, spec::FIXTURE.by_id("create_message"));
         assert!(message.contains("errors: {\"content\""), "{message}");
         assert!(
             message.contains("discord_docs {\"operation\": \"create_message\"}"),

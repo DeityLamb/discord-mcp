@@ -299,11 +299,11 @@ pub fn unknown_route(method: &str, path: &str, nearest: &[&Operation]) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spec::EMBEDDED;
+    use crate::spec::FIXTURE;
 
     #[test]
     fn operation_reference_has_parameters_body_and_result() {
-        let text = operation(&EMBEDDED, "create_message").unwrap();
+        let text = operation(&FIXTURE, "create_message").unwrap();
         assert!(
             text.starts_with("POST /channels/{channel_id}/messages — create_message"),
             "{text}"
@@ -317,16 +317,16 @@ mod tests {
 
     #[test]
     fn operation_is_found_by_method_and_path() {
-        let by_template = operation(&EMBEDDED, "GET /channels/{channel_id}/messages").unwrap();
+        let by_template = operation(&FIXTURE, "GET /channels/{channel_id}/messages").unwrap();
         assert!(by_template.contains("list_messages"));
         assert!(by_template.contains("limit?: integer (1..100)"), "{by_template}");
-        let by_real_path = operation(&EMBEDDED, "get /channels/123/messages").unwrap();
+        let by_real_path = operation(&FIXTURE, "get /channels/123/messages").unwrap();
         assert_eq!(by_template, by_real_path);
     }
 
     #[test]
     fn a_bare_path_shows_every_method() {
-        let text = operation(&EMBEDDED, "/users/@me").unwrap();
+        let text = operation(&FIXTURE, "/users/@me").unwrap();
         assert!(
             text.contains("get_my_user") && text.contains("update_my_user"),
             "{text}"
@@ -336,27 +336,27 @@ mod tests {
     #[test]
     fn misses_point_somewhere() {
         assert!(
-            operation(&EMBEDDED, "POST /users/@me")
+            operation(&FIXTURE, "POST /users/@me")
                 .unwrap_err()
                 .contains("GET, PATCH")
         );
         assert!(
-            operation(&EMBEDDED, "send_message")
+            operation(&FIXTURE, "send_message")
                 .unwrap_err()
                 .contains("create_message")
         );
-        assert!(schema(&EMBEDDED, "embed").unwrap_err().contains("RichEmbed"));
+        assert!(schema(&FIXTURE, "embed").unwrap_err().contains("RichEmbed"));
     }
 
     #[test]
     fn no_content_endpoints_say_so() {
-        let text = operation(&EMBEDDED, "delete_message").unwrap();
+        let text = operation(&FIXTURE, "delete_message").unwrap();
         assert!(text.contains("returns: nothing (204)"), "{text}");
     }
 
     #[test]
     fn keywords_list_endpoints_and_types() {
-        let text = keywords(&EMBEDDED, &["ban".to_owned()]);
+        let text = keywords(&FIXTURE, &["ban".to_owned()]);
         assert!(
             text.contains("PUT /guilds/{guild_id}/bans/{user_id} — ban_user_from_guild"),
             "{text}"

@@ -165,8 +165,13 @@ struct Client {
 
 impl Client {
     async fn start(discord: &Discord, state: &Path, flags: &[&str]) -> Self {
+        // A cache holding the spec, as after a first download, so nothing is fetched.
+        let cache = state.join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::copy("spec/openapi.json", cache.join("openapi.json")).unwrap();
         let mut child = Command::new(env!("CARGO_BIN_EXE_discord-mcp"))
             .arg("--no-spec-update")
+            .env("DISCORD_MCP_CACHE_DIR", &cache)
             .args(flags)
             .env("DISCORD_TOKEN", "tok")
             .env("DISCORD_API_BASE", format!("http://127.0.0.1:{}", discord.port))

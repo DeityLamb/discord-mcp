@@ -1,0 +1,36 @@
+[package]
+name = "discord-mcp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "MCP server for Discord: the whole REST API through one passthrough, with the API reference built in"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/DeityLamb/discord-mcp"
+readme = "README.md"
+keywords = ["mcp", "discord", "llm", "bot", "ai"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+clap = { version = "4.6", features = ["derive", "env"] }
+futures-util = { version = "0.3", default-features = false }
+getrandom = "0.4"
+jaq-core = "3.1"
+jaq-json = { version = "2.0", features = ["serde"] }
+jaq-std = "3.0"
+mime_guess = "2"
+reqwest = { version = "0.13", default-features = false, features = ["json", "multipart", "query", "rustls", "http2"] }
+rmcp = { version = "3.9", features = ["server", "transport-io"] }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+serde_path_to_error = "0.1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "io-std", "io-util", "fs"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+twilight-gateway = { version = "0.18", default-features = false, features = ["rustls-platform-verifier", "zlib"] }
+
+[dev-dependencies]
+axum = { version = "0.8", features = ["ws"] }
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "time", "sync"] }

@@ -12,7 +12,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
-use crate::events::{self, Query};
+use crate::events::{self, Query, Selection};
 use crate::gateway::{Gateway, State};
 use crate::rest::{Body, FilePart, Layout, Request, Response, Rest};
 use crate::spec::{self, Operation, Route, Spec, normalize_path};
@@ -423,19 +423,8 @@ impl Tools {
         let wait = Duration::from_secs(u64::from(args.wait.unwrap_or(0).min(MAX_WAIT)));
         let started = Instant::now();
         let deadline = started + wait;
-        let newest = gateway.log.cursor();
         let mut notes = Vec::new();
-        let mut cursor = match args.after {
-            None => newest,
-            // Cursors start over with each hub; one from before can only mean "from now".
-            Some(after) if after > newest => {
-                notes.push(format!(
-                    "Cursor {after} is from an earlier connection; this one is at {newest}, so only new events count."
-                ));
-                newest
-            }
-            Some(after) => after,
-        };
+        let mut cursor = start_cursor(args.after, gateway.log.cursor(), &mut notes);
         let mut first = true;
         loop {
             let changed = gateway.log.changed();
@@ -459,30 +448,12 @@ impl Tools {
             cursor = selection.cursor;
             let state = gateway.state();
             let closed = matches!(state, State::Closed { .. });
+            if closed && selection.lines.is_empty() {
+                return Err(format!("No events: the gateway connection is {}.", state.describe()));
+            }
             if !selection.lines.is_empty() || closed || Instant::now() >= deadline {
-                if closed && selection.lines.is_empty() {
-                    return Err(format!("No events: the gateway connection is {}.", state.describe()));
-                }
-                let mut out = selection.lines.join("\n");
-                if selection.lines.is_empty() {
-                    out = if wait.is_zero() {
-                        "No matching events yet.".to_owned()
-                    } else {
-                        format!(
-                            "No matching events in the {:.0} s waited.",
-                            started.elapsed().as_secs_f64()
-                        )
-                    };
-                }
-                out.push_str(&format!("\ncursor: {cursor}"));
-                if selection.more {
-                    out.push_str(&format!(" (more match: call again with after: {cursor})"));
-                }
-                for note in &notes {
-                    out.push_str(&format!("\n{note}"));
-                }
-                out.push_str(&format!("\nGateway: {}.", state.describe()));
-                return Ok(out);
+                let waited = (!wait.is_zero()).then(|| started.elapsed());
+                return Ok(events_answer(&selection, waited, &notes, &state));
             }
             tokio::select! {
                 () = &mut changed => {}
@@ -676,6 +647,44 @@ impl Tools {
         };
         Ok(text + &waited)
     }
+}
+
+/// Where a discord_events call starts reading: after the caller's cursor, or from the newest event.
+fn start_cursor(after: Option<u64>, newest: u64, notes: &mut Vec<String>) -> u64 {
+    match after {
+        None => newest,
+        // Cursors start over with each hub; one from before can only mean "from now".
+        Some(after) if after > newest => {
+            notes.push(format!(
+                "Cursor {after} is from an earlier connection; this one is at {newest}, so only new events count."
+            ));
+            newest
+        }
+        Some(after) => after,
+    }
+}
+
+/// What a discord_events call answers: the events (or that there were none, in the time `waited`), the
+/// cursor to continue from, any notes, and how the connection is.
+fn events_answer(selection: &Selection, waited: Option<Duration>, notes: &[String], state: &State) -> String {
+    let cursor = selection.cursor;
+    let mut out = if !selection.lines.is_empty() {
+        selection.lines.join("\n")
+    } else if let Some(waited) = waited {
+        format!("No matching events in the {:.0} s waited.", waited.as_secs_f64())
+    } else {
+        "No matching events yet.".to_owned()
+    };
+    out.push_str(&format!("\ncursor: {cursor}"));
+    if selection.more {
+        out.push_str(&format!(" (more match: call again with after: {cursor})"));
+    }
+    for note in notes {
+        out.push('\n');
+        out.push_str(note);
+    }
+    out.push_str(&format!("\nGateway: {}.", state.describe()));
+    out
 }
 
 /// The arguments of a request, whichever tool they came through.

@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use rmcp::ServiceExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 
@@ -99,7 +99,7 @@ pub fn key(parts: &[&str]) -> String {
         hash.update(part.len().to_le_bytes());
         hash.update(part.as_bytes());
     }
-    hash.finalize().iter().take(8).map(|b| format!("{b:02x}")).collect()
+    hex(&hash.finalize()[..8])
 }
 
 pub fn file_path(dir: &Path, key: &str) -> PathBuf {
@@ -164,7 +164,11 @@ fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
 fn secret() -> io::Result<String> {
     let mut bytes = [0u8; 32];
     getrandom::fill(&mut bytes).map_err(|e| io::Error::other(e.to_string()))?;
-    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+    Ok(hex(&bytes))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Compare without stopping at the first difference.
@@ -186,6 +190,13 @@ pub async fn read_line<R: AsyncRead + Unpin>(reader: &mut R, max: usize) -> io::
         }
     }
     String::from_utf8(line).map_err(io::Error::other)
+}
+
+/// `value` as one line of JSON: the handshake's other half to [`read_line`].
+pub async fn write_line<W: AsyncWrite + Unpin>(writer: &mut W, value: &impl Serialize) -> io::Result<()> {
+    let mut line = serde_json::to_vec(value)?;
+    line.push(b'\n');
+    writer.write_all(&line).await
 }
 
 async fn until(deadline: Option<Instant>) {
@@ -301,25 +312,19 @@ async fn session(mut stream: TcpStream, secret: &str, shared: &Shared) -> Result
         .await
         .map_err(|_| "no hello in time".to_owned())?
         .map_err(|e| format!("reading the hello: {e}"))?;
-    let hello = serde_json::from_str::<Hello>(&line).ok();
-    let refusal = match &hello {
-        None => Some("that isn't a discord-mcp hello"),
-        Some(hello) if !same(hello.secret.as_bytes(), secret.as_bytes()) => Some("wrong secret"),
-        Some(_) => None,
+    let hello = match serde_json::from_str::<Hello>(&line) {
+        Err(_) => Err("that isn't a discord-mcp hello"),
+        Ok(hello) if !same(hello.secret.as_bytes(), secret.as_bytes()) => Err("wrong secret"),
+        Ok(hello) => Ok(hello),
     };
     let welcome = Welcome {
-        ok: refusal.is_none(),
-        error: refusal.map(str::to_owned),
+        ok: hello.is_ok(),
+        error: hello.as_ref().err().map(|&refusal| refusal.to_owned()),
     };
-    let mut answer = serde_json::to_vec(&welcome).map_err(|e| e.to_string())?;
-    answer.push(b'\n');
-    stream
-        .write_all(&answer)
+    write_line(&mut stream, &welcome)
         .await
         .map_err(|e| format!("answering the hello: {e}"))?;
-    let (Some(hello), None) = (hello, refusal) else {
-        return Err(refusal.unwrap_or("refused").to_owned());
-    };
+    let hello = hello?;
     let server = DiscordServer {
         tools: Tools {
             rest: Some(shared.rest.clone()),

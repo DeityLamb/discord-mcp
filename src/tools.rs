@@ -58,8 +58,11 @@ pub struct Tools {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct DocsArgs {
-    /// Keywords to find endpoints by: "ban member", "create thread".
-    query: Option<String>,
+    /// Endpoints whose name, path or description contains any of these: ["thread", "threads", "forum"]. Give
+    /// the variants and synonyms yourself; matching is plain text, any case. [] lists every endpoint.
+    #[serde(default, deserialize_with = "keyword_list")]
+    #[schemars(with = "Option<Vec<String>>")]
+    keywords: Option<Vec<String>>,
     /// One endpoint in full, by name ("create_message") or by method and path ("POST
     /// /channels/{channel_id}/messages"). A path alone shows every method on it.
     operation: Option<String>,
@@ -225,6 +228,20 @@ fn plain(value: &Value) -> String {
     }
 }
 
+/// A list of keywords, or the one keyword an agent may send as a plain string.
+fn keyword_list<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Vec<String>>, D::Error> {
+    Ok(match Option::<Value>::deserialize(deserializer)? {
+        None | Some(Value::Null) => None,
+        Some(Value::String(text)) => Some(vec![text]),
+        Some(Value::Array(items)) => Some(items.iter().map(plain).collect()),
+        Some(_) => {
+            return Err(serde::de::Error::custom(
+                "keywords must be a list of strings, like [\"ban\", \"bans\"]",
+            ));
+        }
+    })
+}
+
 /// The body as JSON, or as the JSON text an agent may send in a string.
 fn lenient_body<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Value>, D::Error> {
     Ok(match Option::<Value>::deserialize(deserializer)? {
@@ -251,7 +268,8 @@ pub fn definitions(options: &Options, events: bool) -> Vec<Tool> {
         tool::<DocsArgs>(
             DOCS,
             "The Discord REST API reference (v10), kept on this machine. No arguments: the common calls and the \
-             API's conventions. query finds endpoints by keywords; operation gives one endpoint in full \
+             API's conventions. keywords lists the endpoints containing any of the words given (pass the \
+             variants yourself, e.g. [\"ban\", \"bans\"]; [] lists all); operation gives one endpoint in full \
              (parameters, body fields, what it returns); schema gives the fields of a named type. Read an \
              endpoint's entry before the first call to it.",
             ToolAnnotations::new().read_only(true).open_world(false),
@@ -509,8 +527,8 @@ impl Tools {
         if let Some(name) = non_empty(&args.schema) {
             parts.push(docs::schema(&spec, name)?);
         }
-        if let Some(query) = non_empty(&args.query) {
-            parts.push(docs::search(&spec, query));
+        if let Some(keywords) = &args.keywords {
+            parts.push(docs::keywords(&spec, keywords));
         }
         if parts.is_empty() {
             parts.push(docs::overview(&spec));

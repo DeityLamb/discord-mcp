@@ -1,15 +1,18 @@
-//! What discord_docs answers: the overview, endpoint search, one endpoint
-//! in full, one named type.
+//! What discord_docs answers: the overview, endpoints by keyword, one
+//! endpoint in full, one named type.
 
 use serde_json::Value;
 
 use crate::schema::{self, ref_name, type_expr};
 use crate::spec::{Operation, Route, Spec, templates};
 
-const SEARCH_LIMIT: usize = 20;
+/// Types listed under an endpoint list.
+const TYPES_LIMIT: usize = 8;
 
 const OVERVIEW: &str = r#"This tool:
-  {"query": "ban member"}           find endpoints by keywords
+  {"keywords": ["ban", "bans"]}     endpoints whose name, path or description contains any keyword;
+                                    give the variants yourself ("thread", "threads", "forum")
+  {"keywords": []}                  every endpoint
   {"operation": "create_message"}   one endpoint in full: parameters, body fields, what it returns
                                     (also as "POST /channels/{channel_id}/messages")
   {"schema": "RichEmbed"}           the fields of a named type
@@ -80,22 +83,37 @@ fn line(op: &Operation) -> String {
     }
 }
 
-pub fn search(spec: &Spec, query: &str) -> String {
-    let found = spec.search(query, SEARCH_LIMIT);
-    let types = spec.search_schemas(query, 8);
-    let mut out = String::new();
-    if found.hits.is_empty() {
-        out.push_str(&format!(
-            "No endpoint matches \"{query}\". Try the words Discord's API uses (guild for server, create/update/delete, \
-             member, role, channel, message, thread, webhook, invite, emoji, command)."
-        ));
+/// Endpoints containing any of the keywords, those with more of them first. None: every endpoint.
+pub fn keywords(spec: &Spec, keywords: &[String]) -> String {
+    listing(spec, keywords, usize::MAX)
+}
+
+fn listing(spec: &Spec, keywords: &[String], limit: usize) -> String {
+    let mut found = spec.find(keywords);
+    let total = found.len();
+    found.truncate(limit);
+    let types = spec.find_schemas(keywords, TYPES_LIMIT);
+    let wanted = keywords
+        .iter()
+        .map(|k| format!("\"{k}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut out = if keywords.is_empty() {
+        format!("All {} endpoints:\n", found.len())
+    } else if found.is_empty() {
+        format!(
+            "No endpoint contains {wanted}. Try other forms or the words Discord's API uses (guild for server, \
+             create/update/delete, member, role, channel, message, thread, webhook, invite, emoji, command), or \
+             list every endpoint with {{\"keywords\": []}}."
+        )
     } else {
-        if found.matched < found.words {
-            out.push_str(&format!("No endpoint matches every word of \"{query}\". Closest:\n"));
-        } else {
-            out.push_str(&format!("Endpoints matching \"{query}\":\n"));
-        }
-        out.push_str(&found.hits.iter().map(|op| line(op)).collect::<Vec<_>>().join("\n"));
+        format!("{total} endpoints contain {wanted}:\n")
+    };
+    out.push_str(&found.iter().map(|(op, _)| line(op)).collect::<Vec<_>>().join("\n"));
+    if total > found.len() {
+        out.push_str(&format!("\n… and {} more.", total - found.len()));
+    }
+    if !found.is_empty() {
         out.push_str("\nRead one in full with {\"operation\": \"<name>\"}.");
     }
     if !types.is_empty() {
@@ -118,7 +136,7 @@ pub fn operation(spec: &Spec, what: &str) -> Result<String, String> {
                 Some(op) => Ok(render_operation(spec, op)),
                 None => Err(format!(
                     "No endpoint is named {what}.\n{}",
-                    search(spec, &what.replace('_', " "))
+                    listing(spec, &what.split('_').map(str::to_owned).collect::<Vec<_>>(), 10)
                 )),
             };
         }
@@ -163,7 +181,7 @@ pub fn schema(spec: &Spec, name: &str) -> Result<String, String> {
     match spec.schema(name) {
         Some((name, schema)) => Ok(schema::render_named(spec, name, schema)),
         None => {
-            let close = spec.search_schemas(name, 12);
+            let close = spec.find_schemas(&[name.to_owned()], 12);
             Err(if close.is_empty() {
                 format!("No type is named {name}. Type names appear in an endpoint's reference: {{\"operation\": …}}.")
             } else {
@@ -274,7 +292,7 @@ pub fn unknown_route(method: &str, path: &str, nearest: &[&Operation]) -> String
     if !near.is_empty() {
         out.push_str(&format!("\nPaths that start the same: {}", near.join(", ")));
     }
-    out.push_str("\nFind the right one with discord_docs {\"query\": \"…\"}.");
+    out.push_str("\nFind the right one with discord_docs {\"keywords\": [\"…\"]}.");
     out
 }
 
@@ -337,8 +355,8 @@ mod tests {
     }
 
     #[test]
-    fn search_lists_endpoints_and_types() {
-        let text = search(&EMBEDDED, "ban");
+    fn keywords_list_endpoints_and_types() {
+        let text = keywords(&EMBEDDED, &["ban".to_owned()]);
         assert!(
             text.contains("PUT /guilds/{guild_id}/bans/{user_id} — ban_user_from_guild"),
             "{text}"

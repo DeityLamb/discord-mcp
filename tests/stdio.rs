@@ -50,7 +50,7 @@ async fn a_client_can_list_and_call_the_tools() {
     let mut requests = hello().to_vec();
     requests.push(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
     requests.push(json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
-        "name": "discord_docs", "arguments": {"query": "ban member"}
+        "name": "discord_docs", "arguments": {"keywords": ["ban", "kick"]}
     }}));
     requests.push(json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {
         "name": "discord_get", "arguments": {"path": "/users/@me"}

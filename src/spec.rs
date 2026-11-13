@@ -42,8 +42,9 @@ pub struct Operation {
     pub id: String,
     pub description: Option<String>,
     segments: Vec<Segment>,
-    /// Lowercase words of the id, the path's literal parts and the description.
-    words: Vec<String>,
+    /// The id, path and description in lowercase, with every run of punctuation made one space:
+    /// what keywords are looked for in.
+    text: String,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -63,15 +64,6 @@ pub enum Route<'a> {
     Unknown {
         nearest: Vec<&'a Operation>,
     },
-}
-
-pub struct Search<'a> {
-    /// Best first; only the endpoints that match the most words.
-    pub hits: Vec<&'a Operation>,
-    /// How many of the query's words those endpoints match.
-    pub matched: usize,
-    /// How many words the query has, small words aside.
-    pub words: usize,
 }
 
 impl Operation {
@@ -146,22 +138,14 @@ impl Spec {
                         None => Segment::Literal(s.to_owned()),
                     })
                     .collect();
-                let mut words = words_of(&id);
-                for segment in &segments {
-                    if let Segment::Literal(s) = segment {
-                        words.extend(words_of(s));
-                    }
-                }
-                if let Some(d) = &description {
-                    words.extend(words_of(d));
-                }
+                let text = plain(&format!("{id} {path} {}", description.as_deref().unwrap_or("")));
                 ops.push(Operation {
                     method,
                     path: path.clone(),
                     id,
                     description,
                     segments,
-                    words,
+                    text,
                 });
             }
         }
@@ -237,59 +221,39 @@ impl Spec {
         self.ops.iter().filter(|op| op.path == template).collect()
     }
 
-    /// Endpoints matching the query's words.
-    pub fn search(&self, query: &str, limit: usize) -> Search<'_> {
-        let tokens: Vec<String> = words_of(query)
-            .into_iter()
-            .filter(|w| !STOP_WORDS.contains(&w.as_str()))
+    /// Endpoints whose name, path or description contains any of the keywords, with how many each
+    /// contains: most first, then by path. No keywords: every endpoint.
+    pub fn find(&self, keywords: &[String]) -> Vec<(&Operation, usize)> {
+        let keywords: Vec<String> = keywords.iter().map(|k| plain(k)).filter(|k| !k.is_empty()).collect();
+        let mut found: Vec<(&Operation, usize)> = self
+            .ops
+            .iter()
+            .map(|op| (op, keywords.iter().filter(|k| op.text.contains(k.as_str())).count()))
+            .filter(|(_, n)| *n > 0 || keywords.is_empty())
             .collect();
-        let mut hits: Vec<(usize, u32, &Operation)> = Vec::new();
-        for op in &self.ops {
-            let mut matched = 0;
-            let mut score = 0;
-            for token in &tokens {
-                let s = token_score(token, op);
-                if s > 0 {
-                    matched += 1;
-                    score += s;
-                }
-            }
-            if matched > 0 {
-                hits.push((matched, score, op));
-            }
-        }
-        let most = hits.iter().map(|h| h.0).max().unwrap_or(0);
-        hits.retain(|h| h.0 == most);
-        // On equal scores the endpoint named in fewer words is the plainer one: create_message before
-        // create_lobby_message, list_pins before deprecated_list_pins.
-        let name_words = |op: &Operation| op.id.split('_').count();
-        hits.sort_by(|a, b| {
+        found.sort_by(|a, b| {
             b.1.cmp(&a.1)
-                .then(name_words(a.2).cmp(&name_words(b.2)))
-                .then(a.2.path.len().cmp(&b.2.path.len()))
-                .then(a.2.method.cmp(b.2.method))
+                .then(a.0.path.cmp(&b.0.path))
+                .then(a.0.method.cmp(b.0.method))
         });
-        Search {
-            hits: hits.into_iter().take(limit).map(|(_, _, op)| op).collect(),
-            matched: most,
-            words: tokens.len(),
-        }
+        found
     }
 
-    /// Names of schemas containing every word of the query.
-    pub fn search_schemas(&self, query: &str, limit: usize) -> Vec<&str> {
-        let tokens = words_of(query);
+    /// Names of types containing any of the keywords, shortest first.
+    pub fn find_schemas(&self, keywords: &[String], limit: usize) -> Vec<&str> {
+        let keywords: Vec<String> = keywords
+            .iter()
+            .map(|k| plain(k).replace(' ', ""))
+            .filter(|k| !k.is_empty())
+            .collect();
         let Some(schemas) = self.doc["components"]["schemas"].as_object() else {
             return Vec::new();
         };
-        if tokens.is_empty() {
-            return Vec::new();
-        }
         let mut names: Vec<&str> = schemas
             .keys()
             .filter(|name| {
                 let lower = name.to_ascii_lowercase();
-                tokens.iter().all(|t| lower.contains(singular(t)))
+                keywords.iter().any(|k| lower.contains(k.as_str()))
             })
             .map(String::as_str)
             .collect();
@@ -313,111 +277,14 @@ impl Spec {
     }
 }
 
-const STOP_WORDS: [&str; 18] = [
-    "a", "an", "the", "to", "in", "of", "for", "on", "from", "and", "with", "how", "do", "i", "by", "is", "at", "into",
-];
-
-/// What people call a verb or a thing, and what the spec calls it.
-const SYNONYMS: [(&str, &[&str]); 24] = [
-    ("send", &["create", "execute"]),
-    ("post", &["create"]),
-    ("write", &["create"]),
-    ("make", &["create"]),
-    ("new", &["create"]),
-    ("edit", &["update"]),
-    ("modify", &["update"]),
-    ("change", &["update"]),
-    ("rename", &["update"]),
-    ("patch", &["update"]),
-    ("set", &["update", "set"]),
-    ("remove", &["delete", "remove"]),
-    ("clear", &["delete"]),
-    ("revoke", &["delete", "revoke"]),
-    ("fetch", &["get", "list"]),
-    ("read", &["get", "list"]),
-    ("show", &["get", "list"]),
-    ("find", &["search", "get", "list"]),
-    ("get", &["get", "list"]),
-    ("list", &["list", "get"]),
-    ("server", &["guild"]),
-    ("user", &["user", "member"]),
-    ("react", &["reaction"]),
-    ("slash", &["command"]),
-];
-
-/// Words that mean one endpoint the spec names differently.
-const ALIASES: [(&str, &[&str]); 16] = [
-    ("kick", &["delete_guild_member"]),
-    ("timeout", &["update_guild_member"]),
-    ("mute", &["update_guild_member"]),
-    ("deafen", &["update_guild_member"]),
-    ("nickname", &["update_guild_member", "update_my_guild_member"]),
-    ("nick", &["update_guild_member", "update_my_guild_member"]),
-    ("purge", &["bulk_delete_messages"]),
-    ("history", &["list_messages"]),
-    ("reply", &["create_message"]),
-    ("upload", &["create_message"]),
-    ("attachment", &["create_message"]),
-    ("file", &["create_message"]),
-    ("embed", &["create_message"]),
-    ("unpin", &["delete_pin"]),
-    ("topic", &["update_channel"]),
-    ("slowmode", &["update_channel"]),
-];
-
-/// How well one query word matches an endpoint: 0 is no match.
-fn token_score(token: &str, op: &Operation) -> u32 {
-    if ALIASES
-        .iter()
-        .any(|(word, ids)| *word == singular(token) && ids.contains(&op.id.as_str()))
-    {
-        return 5;
-    }
-    let alternatives = SYNONYMS
-        .iter()
-        .find(|(word, _)| *word == token)
-        .map(|(_, alts)| alts.to_vec());
-    let direct = word_score(token, op);
-    let via_synonym = alternatives
-        .into_iter()
-        .flatten()
-        .map(|alt| word_score(alt, op))
-        .max()
-        .unwrap_or(0);
-    direct.max(via_synonym)
-}
-
-fn word_score(word: &str, op: &Operation) -> u32 {
-    // The id's words come first in `words`; a hit there says more than one in the description.
-    let id_words = op.id.split('_').count();
-    let mut best = 0;
-    for (i, have) in op.words.iter().enumerate() {
-        let weight = if i < id_words { 2 } else { 1 };
-        let hit = if have == word || singular(have) == singular(word) {
-            2
-        } else if word.len() >= 3 && have.starts_with(word) {
-            1
-        } else {
-            0
-        };
-        best = best.max(hit * weight);
-    }
-    best
-}
-
-fn singular(word: &str) -> &str {
-    match word.strip_suffix('s') {
-        Some(stem) if stem.len() >= 3 && !stem.ends_with('s') => stem,
-        _ => word,
-    }
-}
-
-/// Lowercase alphanumeric runs (`@me` stays whole).
-fn words_of(text: &str) -> Vec<String> {
-    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '@'))
+/// Lowercase, with every run of characters other than letters, digits and `@` made one space:
+/// `create_thread`, `create-thread` and `Create Thread` all read `create thread`.
+fn plain(text: &str) -> String {
+    text.split(|c: char| !(c.is_alphanumeric() || c == '@'))
         .filter(|w| !w.is_empty())
-        .map(str::to_ascii_lowercase)
-        .collect()
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// A path as an agent wrote it, made into what goes after the API base:
@@ -630,23 +497,27 @@ mod tests {
     }
 
     #[test]
-    fn search_understands_everyday_words() {
-        let top = |q: &str| {
+    fn keywords_match_names_paths_and_descriptions_as_written() {
+        let ids = |keywords: &[&str]| {
+            let keywords: Vec<String> = keywords.iter().map(|k| k.to_string()).collect();
             EMBEDDED
-                .search(q, 5)
-                .hits
-                .first()
-                .map(|op| op.id.clone())
-                .unwrap_or_default()
+                .find(&keywords)
+                .iter()
+                .map(|(op, _)| op.id.clone())
+                .collect::<Vec<_>>()
         };
-        assert_eq!(top("send message"), "create_message");
-        assert_eq!(top("kick member"), "delete_guild_member");
-        assert_eq!(top("ban user"), "ban_user_from_guild");
-        assert_eq!(top("edit message"), "update_message");
-        assert_eq!(top("list server channels"), "list_guild_channels");
-        assert_eq!(top("purge messages"), "bulk_delete_messages");
-        assert_eq!(top("create thread"), "create_thread");
-        assert!(EMBEDDED.search("zzzz qqqq", 5).hits.is_empty());
+        let threads = ids(&["thread"]);
+        assert!(threads.contains(&"create_thread".to_owned()));
+        assert!(threads.contains(&"create_thread_from_message".to_owned()));
+        // Any keyword is enough; one that matches more comes first.
+        let kick = ids(&["kick", "remove member", "guild member"]);
+        assert!(kick.contains(&"delete_guild_member".to_owned()));
+        assert!(ids(&["audit log"]).contains(&"list_guild_audit_log_entries".to_owned()));
+        assert!(ids(&["Bulk-Delete"]).contains(&"bulk_delete_messages".to_owned()));
+        let both = ids(&["ban", "guild"]);
+        assert!(both.iter().position(|id| id == "ban_user_from_guild") < both.iter().position(|id| id == "get_guild"));
+        assert!(ids(&["zzzz"]).is_empty());
+        assert_eq!(ids(&[]).len(), EMBEDDED.ops.len());
     }
 
     #[test]

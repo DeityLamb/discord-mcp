@@ -14,3 +14,17 @@ pub mod schema;
 pub mod spec;
 pub mod tools;
 pub mod update;
+
+use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
+/// A directory named by an environment variable, unless it is unset or empty.
+pub(crate) fn env_dir(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name).filter(|v| !v.is_empty()).map(PathBuf::from)
+}
+
+/// Take a lock even if a thread panicked while holding it. What the locks here guard is a cache or a
+/// piece of state that stays usable after a panic, so one panic shouldn't turn into a panic for everyone.
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}

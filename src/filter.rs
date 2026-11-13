@@ -19,6 +19,15 @@ pub fn compact(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|e| format!("(unprintable JSON: {e})"))
 }
 
+/// A JSON value as plain text: a string as it is, anything else as compact JSON. What a query
+/// parameter or a form field holds.
+pub fn plain(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
 /// A jq filter, compiled once and run on as many values as needed.
 pub struct Program(jaq_core::Filter<data::JustLut<Val>>);
 
@@ -38,14 +47,12 @@ impl Program {
                     jaq_core::load::Error::Io(list) => {
                         problems.extend(list.into_iter().map(|(path, e)| format!("can't load {path}: {e}")))
                     }
-                    jaq_core::load::Error::Lex(list) => problems.extend(
-                        list.into_iter()
-                            .map(|(expected, at)| format!("expected {} at `{}`", expected.as_str(), start(at))),
-                    ),
-                    jaq_core::load::Error::Parse(list) => problems.extend(
-                        list.into_iter()
-                            .map(|(expected, at)| format!("expected {} at `{}`", expected.as_str(), start(at))),
-                    ),
+                    jaq_core::load::Error::Lex(list) => {
+                        problems.extend(list.into_iter().map(|(what, at)| expected(what.as_str(), at)))
+                    }
+                    jaq_core::load::Error::Parse(list) => {
+                        problems.extend(list.into_iter().map(|(what, at)| expected(what.as_str(), at)))
+                    }
                 }
             }
             format!("jq filter doesn't parse: {}", problems.join("; "))
@@ -61,14 +68,18 @@ impl Program {
         Ok(Self(compiled))
     }
 
+    /// What the filter runs in: its definitions, and no variables.
+    fn ctx(&self) -> Ctx<'_, data::JustLut<Val>> {
+        Ctx::new(&self.0.lut, Vars::new([]))
+    }
+
     /// Each output on its own line: strings as they are, everything else as compact JSON. Stops once
     /// `max_chars` is passed, since the caller cuts there anyway.
     pub fn run(&self, input: &Value, max_chars: usize) -> Result<String, String> {
         let input = Val::deserialize(input).map_err(|e| format!("response isn't JSON jq can read: {e}"))?;
-        let ctx = Ctx::<data::JustLut<Val>>::new(&self.0.lut, Vars::new([]));
         let deadline = Instant::now() + JQ_TIMEOUT;
         let mut out = String::new();
-        for result in self.0.id.run((ctx, input)) {
+        for result in self.0.id.run((self.ctx(), input)) {
             let value = match result {
                 Ok(value) => value,
                 Err(exception) => {
@@ -105,14 +116,18 @@ impl Program {
         let Ok(input) = Val::deserialize(input) else {
             return false;
         };
-        let ctx = Ctx::<data::JustLut<Val>>::new(&self.0.lut, Vars::new([]));
-        matches!(self.0.id.run((ctx, input)).next(), Some(Ok(value)) if !matches!(value, Val::Null | Val::Bool(false)))
+        matches!(self.0.id.run((self.ctx(), input)).next(), Some(Ok(value)) if !matches!(value, Val::Null | Val::Bool(false)))
     }
 }
 
 /// Run a jq filter over `input` once.
 pub fn jq(filter: &str, input: &Value, max_chars: usize) -> Result<String, String> {
     Program::compile(filter)?.run(input, max_chars)
+}
+
+/// A lexer's or parser's complaint: what it wanted, and where.
+fn expected(what: &str, at: &str) -> String {
+    format!("expected {what} at `{}`", start(at))
 }
 
 fn start(text: &str) -> String {

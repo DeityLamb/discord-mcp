@@ -12,7 +12,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
-use crate::events::{self, Query};
+use crate::events::{self, Query, Selection};
 use crate::gateway::{Gateway, State};
 use crate::rest::{Body, FilePart, Layout, Request, Response, Rest};
 use crate::spec::{self, Operation, Route, Spec, normalize_path};
@@ -28,6 +28,9 @@ pub const GATEWAY: &str = "discord_gateway";
 const MAX_FILES: usize = 10;
 /// Time a filter gets beyond its own limit before the call stops waiting for it.
 const JQ_GRACE: Duration = Duration::from_secs(2);
+/// What a caller hears of a filter that outran [`JQ_GRACE`], and the same after a request that went out.
+const JQ_ABANDONED: &str = "jq filter ran too long and was abandoned.";
+const JQ_ABANDONED_AFTER_REQUEST: &str = "jq filter ran too long and was abandoned; the request itself went through.";
 /// Events one discord_events call returns unless told otherwise, and at most.
 const DEFAULT_EVENTS: u32 = 50;
 const MAX_EVENTS: u32 = 500;
@@ -35,6 +38,8 @@ const MAX_EVENTS: u32 = 500;
 const MAX_WAIT: u32 = 300;
 /// Longest a call waits for the API reference on a first start, while it downloads.
 const SPEC_WAIT: Duration = Duration::from_secs(30);
+/// The answer to a write under `--read-only`.
+const READ_ONLY: &str = "This server runs read-only (--read-only): nothing on Discord can be changed through it.";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Options {
@@ -168,13 +173,13 @@ enum WriteMethod {
     Delete,
 }
 
-impl WriteMethod {
-    fn method(self) -> Method {
-        match self {
-            Self::Post => Method::POST,
-            Self::Put => Method::PUT,
-            Self::Patch => Method::PATCH,
-            Self::Delete => Method::DELETE,
+impl From<WriteMethod> for Method {
+    fn from(method: WriteMethod) -> Self {
+        match method {
+            WriteMethod::Post => Self::POST,
+            WriteMethod::Put => Self::PUT,
+            WriteMethod::Patch => Self::PATCH,
+            WriteMethod::Delete => Self::DELETE,
         }
     }
 }
@@ -202,10 +207,10 @@ fn lenient_query<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<(Stri
                     // A list is the parameter repeated.
                     Value::Array(items) => {
                         for item in items {
-                            out.push((name.clone(), plain(&item)));
+                            out.push((name.clone(), filter::plain(&item)));
                         }
                     }
-                    other => out.push((name, plain(&other))),
+                    other => out.push((name, filter::plain(&other))),
                 }
             }
         }
@@ -223,19 +228,12 @@ fn lenient_query<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<(Stri
     Ok(out)
 }
 
-fn plain(value: &Value) -> String {
-    match value {
-        Value::String(s) => s.clone(),
-        other => other.to_string(),
-    }
-}
-
 /// A list of keywords, or the one keyword an agent may send as a plain string.
 fn keyword_list<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Vec<String>>, D::Error> {
     Ok(match Option::<Value>::deserialize(deserializer)? {
         None | Some(Value::Null) => None,
         Some(Value::String(text)) => Some(vec![text]),
-        Some(Value::Array(items)) => Some(items.iter().map(plain).collect()),
+        Some(Value::Array(items)) => Some(items.iter().map(filter::plain).collect()),
         Some(_) => {
             return Err(serde::de::Error::custom(
                 "keywords must be a list of strings, like [\"ban\", \"bans\"]",
@@ -327,63 +325,25 @@ pub fn definitions(options: &Options, events: bool) -> Vec<Tool> {
 
 impl Tools {
     pub async fn call(&self, name: &str, args: Option<JsonObject>) -> CallToolResult {
-        let args = Value::Object(args.unwrap_or_default());
-        let result = match name {
-            DOCS => match parse::<DocsArgs>(args) {
-                Ok(a) => self.docs(a).await,
-                Err(e) => Err(e),
-            },
-            GET => match parse::<GetArgs>(args) {
-                Ok(a) => {
-                    let wanted = Wanted {
-                        method: Method::GET,
-                        path: a.path,
-                        query: a.query,
-                        body: None,
-                        files: Vec::new(),
-                        reason: None,
-                        jq: a.jq,
-                    };
-                    self.request(wanted).await
-                }
-                Err(e) => Err(e),
-            },
-            CALL if self.options.read_only => {
-                Err("This server runs read-only (--read-only): nothing on Discord can be changed through it.".into())
-            }
-            CALL => match parse::<CallArgs>(args) {
-                Ok(a) => {
-                    let wanted = Wanted {
-                        method: a.method.method(),
-                        path: a.path,
-                        query: a.query,
-                        body: a.body,
-                        files: a.files,
-                        reason: a.reason,
-                        jq: a.jq,
-                    };
-                    self.request(wanted).await
-                }
-                Err(e) => Err(e),
-            },
-            EVENTS => match parse::<EventsArgs>(args) {
-                Ok(a) => self.events(a).await,
-                Err(e) => Err(e),
-            },
-            GATEWAY if self.options.read_only => {
-                Err("This server runs read-only (--read-only): nothing on Discord can be changed through it.".into())
-            }
-            GATEWAY => match parse::<GatewayArgs>(args) {
-                Ok(a) => self.gateway_command(a).await,
-                Err(e) => Err(e),
-            },
+        let result = self.dispatch(name, Value::Object(args.unwrap_or_default())).await;
+        let text = |text| vec![ContentBlock::text(filter::cap(text, self.options.max_output))];
+        match result {
+            Ok(answer) => CallToolResult::success(text(answer)),
+            Err(error) => CallToolResult::error(text(error)),
+        }
+    }
+
+    async fn dispatch(&self, name: &str, args: Value) -> Result<String, String> {
+        match name {
+            CALL | GATEWAY if self.options.read_only => Err(READ_ONLY.into()),
+            DOCS => self.docs(parse(args)?).await,
+            GET => self.request(parse::<GetArgs>(args)?.into()).await,
+            CALL => self.request(parse::<CallArgs>(args)?.into()).await,
+            EVENTS => self.events(parse(args)?).await,
+            GATEWAY => self.gateway_command(parse(args)?).await,
             other => Err(format!(
                 "No tool is named {other}. There are {DOCS}, {GET}, {CALL}, {EVENTS} and {GATEWAY}."
             )),
-        };
-        match result {
-            Ok(text) => CallToolResult::success(vec![ContentBlock::text(filter::cap(text, self.options.max_output))]),
-            Err(text) => CallToolResult::error(vec![ContentBlock::text(filter::cap(text, self.options.max_output))]),
         }
     }
 
@@ -391,19 +351,18 @@ impl Tools {
         definitions(&self.options, self.gateway.is_some())
     }
 
-    fn no_gateway(&self) -> String {
+    fn no_gateway(&self) -> &'static str {
         if self.rest.is_none() {
-            "No bot token: set DISCORD_TOKEN in this server's environment, then reconnect.".to_owned()
+            "No bot token: set DISCORD_TOKEN in this server's environment, then reconnect."
         } else {
             "This server runs without the gateway (--disable-gateway), so there are no events or gateway \
              commands. REST still answers what happened: recent messages with GET /channels/{channel_id}/messages."
-                .to_owned()
         }
     }
 
     async fn gateway_command(&self, args: GatewayArgs) -> Result<String, String> {
         let Some(gateway) = &self.gateway else {
-            return Err(self.no_gateway());
+            return Err(self.no_gateway().into());
         };
         let data = args.data.unwrap_or_else(|| Value::Object(Map::new()));
         match args.op {
@@ -416,14 +375,15 @@ impl Tools {
             }
             GatewayOp::RequestGuildMembers => {
                 let members = gateway.request_members(data).await?;
-                self.shape(members, args.jq).await
+                self.shape(members, args.jq, JQ_ABANDONED).await
             }
         }
     }
 
-    /// JSON for the answer: compact, or through the caller's jq filter.
-    async fn shape(&self, value: Value, jq: Option<String>) -> Result<String, String> {
-        let Some(program) = jq.filter(|f| !f.trim().is_empty()) else {
+    /// JSON for the answer: compact, or through the caller's jq filter. `abandoned` is the error for a
+    /// filter that outruns its clock.
+    async fn shape(&self, value: Value, jq: Option<String>, abandoned: &str) -> Result<String, String> {
+        let Some(program) = given(jq) else {
             return Ok(filter::compact(&value));
         };
         let max = self.options.max_output;
@@ -432,14 +392,14 @@ impl Tools {
         match tokio::time::timeout(filter::JQ_TIMEOUT + JQ_GRACE, run).await {
             Ok(Ok(result)) => result,
             Ok(Err(e)) => Err(format!("jq filter crashed: {e}")),
-            Err(_) => Err("jq filter ran too long and was abandoned.".into()),
+            Err(_) => Err(abandoned.into()),
         }
     }
 
     /// Events from the gateway's buffer, waiting for one if asked to.
     async fn events(&self, args: EventsArgs) -> Result<String, String> {
         let Some(gateway) = &self.gateway else {
-            return Err(self.no_gateway());
+            return Err(self.no_gateway().into());
         };
         // The first call opens the session; its cursor should point past the servers arriving.
         if gateway.start() || matches!(gateway.state(), State::Connecting) {
@@ -447,27 +407,16 @@ impl Tools {
         }
         let query = Arc::new(Query {
             types: args.types.iter().map(|t| t.trim().to_ascii_uppercase()).collect(),
-            condition: args.filter.filter(|f| !f.trim().is_empty()),
-            shape: args.jq.filter(|f| !f.trim().is_empty()),
+            condition: given(args.filter),
+            shape: given(args.jq),
             limit: args.limit.unwrap_or(DEFAULT_EVENTS).clamp(1, MAX_EVENTS) as usize,
             max_chars: self.options.max_output,
         });
         let wait = Duration::from_secs(u64::from(args.wait.unwrap_or(0).min(MAX_WAIT)));
         let started = Instant::now();
         let deadline = started + wait;
-        let newest = gateway.log.cursor();
         let mut notes = Vec::new();
-        let mut cursor = match args.after {
-            None => newest,
-            // Cursors start over with each hub; one from before can only mean "from now".
-            Some(after) if after > newest => {
-                notes.push(format!(
-                    "Cursor {after} is from an earlier connection; this one is at {newest}, so only new events count."
-                ));
-                newest
-            }
-            Some(after) => after,
-        };
+        let mut cursor = start_cursor(args.after, gateway.log.cursor(), &mut notes);
         let mut first = true;
         loop {
             let changed = gateway.log.changed();
@@ -491,30 +440,12 @@ impl Tools {
             cursor = selection.cursor;
             let state = gateway.state();
             let closed = matches!(state, State::Closed { .. });
+            if closed && selection.lines.is_empty() {
+                return Err(format!("No events: the gateway connection is {}.", state.describe()));
+            }
             if !selection.lines.is_empty() || closed || Instant::now() >= deadline {
-                if closed && selection.lines.is_empty() {
-                    return Err(format!("No events: the gateway connection is {}.", state.describe()));
-                }
-                let mut out = selection.lines.join("\n");
-                if selection.lines.is_empty() {
-                    out = if wait.is_zero() {
-                        "No matching events yet.".to_owned()
-                    } else {
-                        format!(
-                            "No matching events in the {:.0} s waited.",
-                            started.elapsed().as_secs_f64()
-                        )
-                    };
-                }
-                out.push_str(&format!("\ncursor: {cursor}"));
-                if selection.more {
-                    out.push_str(&format!(" (more match: call again with after: {cursor})"));
-                }
-                for note in &notes {
-                    out.push_str(&format!("\n{note}"));
-                }
-                out.push_str(&format!("\nGateway: {}.", state.describe()));
-                return Ok(out);
+                let waited = (!wait.is_zero()).then(|| started.elapsed());
+                return Ok(events_answer(&selection, waited, &notes, &state));
             }
             tokio::select! {
                 () = &mut changed => {}
@@ -558,8 +489,7 @@ impl Tools {
         };
         let (path, mut query) = normalize_path(&wanted.path)?;
         query.extend(wanted.query);
-        let method = wanted.method.as_str().to_owned();
-        let method = method.as_str();
+        let method = wanted.method.as_str();
         // Without a reference (the first download failed) the request still goes out, unchecked.
         let (spec, unchecked) = match spec::wait(SPEC_WAIT).await {
             Ok(spec) => (Some(spec), None),
@@ -576,32 +506,34 @@ impl Tools {
                 path: template,
                 allowed,
             } => {
-                let other_tool = if wanted.method == Method::GET { CALL } else { GET };
+                // The methods it takes are the other tool's: say so.
+                let get = wanted.method == Method::GET;
+                let other_tool = if get != allowed.contains(&"GET") {
+                    format!(" Use {} for that.", if get { CALL } else { GET })
+                } else {
+                    String::new()
+                };
                 return Err(format!(
-                    "{template} doesn't take {method}; it takes {}.{}",
-                    allowed.join(", "),
-                    if (wanted.method == Method::GET) != allowed.contains(&"GET") {
-                        format!(" Use {other_tool} for that.")
-                    } else {
-                        String::new()
-                    }
+                    "{template} doesn't take {method}; it takes {}.{other_tool}",
+                    allowed.join(", ")
                 ));
             }
             Route::Unknown { nearest } => return Err(docs::unknown_route(method, &path, &nearest)),
         };
+        let bucket = match operation {
+            Some(operation) => operation.bucket_key(&path),
+            None => format!("{method}{path}"),
+        };
         let (files, layout) = self.uploads(spec.as_deref(), operation, wanted.files).await?;
         let request = Request {
             method: wanted.method,
-            bucket: match operation {
-                Some(operation) => operation.bucket_key(&path),
-                None => format!("{method}{path}"),
-            },
+            bucket,
             path,
             query,
             body: wanted.body,
             files,
             layout,
-            reason: wanted.reason.filter(|r| !r.trim().is_empty()),
+            reason: given(wanted.reason),
         };
         let response = rest.send(&request).await.map_err(|e| e.to_string())?;
         let answer = self.present(response, wanted.jq, operation).await;
@@ -704,26 +636,48 @@ impl Tools {
             ),
             Body::Text(text) => text,
             Body::Binary { content_type, bytes } => format!("{content_type}, {bytes} bytes (not shown)."),
-            Body::Json(value) => match jq.filter(|f| !f.trim().is_empty()) {
-                None => filter::compact(&value),
-                Some(program) => {
-                    let max = self.options.max_output;
-                    // A filter is someone else's program: it runs off the async threads and under a clock.
-                    let run = tokio::task::spawn_blocking(move || filter::jq(&program, &value, max));
-                    match tokio::time::timeout(filter::JQ_TIMEOUT + JQ_GRACE, run).await {
-                        Ok(Ok(result)) => result?,
-                        Ok(Err(e)) => return Err(format!("jq filter crashed: {e}")),
-                        Err(_) => {
-                            return Err(
-                                "jq filter ran too long and was abandoned; the request itself went through.".into(),
-                            );
-                        }
-                    }
-                }
-            },
+            Body::Json(value) => self.shape(value, jq, JQ_ABANDONED_AFTER_REQUEST).await?,
         };
         Ok(text + &waited)
     }
+}
+
+/// Where a discord_events call starts reading: after the caller's cursor, or from the newest event.
+fn start_cursor(after: Option<u64>, newest: u64, notes: &mut Vec<String>) -> u64 {
+    match after {
+        None => newest,
+        // Cursors start over with each hub; one from before can only mean "from now".
+        Some(after) if after > newest => {
+            notes.push(format!(
+                "Cursor {after} is from an earlier connection; this one is at {newest}, so only new events count."
+            ));
+            newest
+        }
+        Some(after) => after,
+    }
+}
+
+/// What a discord_events call answers: the events (or that there were none, in the time `waited`), the
+/// cursor to continue from, any notes, and how the connection is.
+fn events_answer(selection: &Selection, waited: Option<Duration>, notes: &[String], state: &State) -> String {
+    let cursor = selection.cursor;
+    let mut out = if !selection.lines.is_empty() {
+        selection.lines.join("\n")
+    } else if let Some(waited) = waited {
+        format!("No matching events in the {:.0} s waited.", waited.as_secs_f64())
+    } else {
+        "No matching events yet.".to_owned()
+    };
+    out.push_str(&format!("\ncursor: {cursor}"));
+    if selection.more {
+        out.push_str(&format!(" (more match: call again with after: {cursor})"));
+    }
+    for note in notes {
+        out.push('\n');
+        out.push_str(note);
+    }
+    out.push_str(&format!("\nGateway: {}.", state.describe()));
+    out
 }
 
 /// The arguments of a request, whichever tool they came through.
@@ -737,8 +691,41 @@ struct Wanted {
     jq: Option<String>,
 }
 
+impl From<GetArgs> for Wanted {
+    fn from(args: GetArgs) -> Self {
+        Self {
+            method: Method::GET,
+            path: args.path,
+            query: args.query,
+            body: None,
+            files: Vec::new(),
+            reason: None,
+            jq: args.jq,
+        }
+    }
+}
+
+impl From<CallArgs> for Wanted {
+    fn from(args: CallArgs) -> Self {
+        Self {
+            method: args.method.into(),
+            path: args.path,
+            query: args.query,
+            body: args.body,
+            files: args.files,
+            reason: args.reason,
+            jq: args.jq,
+        }
+    }
+}
+
 fn non_empty(text: &Option<String>) -> Option<&str> {
     text.as_deref().map(str::trim).filter(|t| !t.is_empty())
+}
+
+/// An optional argument, with a blank one counted as not given.
+fn given(text: Option<String>) -> Option<String> {
+    text.filter(|t| !t.trim().is_empty())
 }
 
 fn parse<T: DeserializeOwned>(args: Value) -> Result<T, String> {
@@ -783,43 +770,41 @@ fn failure(status: u16, reason: Option<&str>, body: &Body, operation: Option<&Op
         Body::Text(text) => out.push_str(&format!(": {}", text.chars().take(500).collect::<String>())),
         Body::Empty | Body::Binary { .. } => {}
     }
-    let entry = operation
-        .map(|o| format!("discord_docs {{\"operation\": \"{}\"}}", o.id))
-        .unwrap_or_else(|| "discord_docs".into());
+    let entry = match operation {
+        Some(operation) => format!("discord_docs {{\"operation\": \"{}\"}}", operation.id),
+        None => "discord_docs".into(),
+    };
+    // The hints that name the endpoint's entry are made here; the rest are fixed text.
+    let named;
     let hint = match (status, code) {
-        (401, _) => Some(
+        (401, _) => {
             "Discord rejected the bot token. DISCORD_TOKEN must be the token from the application's Bot page, not \
              its client secret or public key."
-                .to_owned(),
-        ),
-        (_, Some(50001)) => {
-            Some("The bot can't see this: it isn't in that server, or it lacks View Channel there.".to_owned())
         }
-        (_, Some(50013)) => Some(
+        (_, Some(50001)) => "The bot can't see this: it isn't in that server, or it lacks View Channel there.",
+        (_, Some(50013)) => {
             "The bot's role lacks a permission this needs, or the target has a role at or above the bot's highest."
-                .to_owned(),
-        ),
-        (_, Some(50035)) => Some(format!(
-            "A field of the request is wrong; errors says which. {entry} lists the fields."
-        )),
-        (_, Some(50007)) => Some("This user doesn't take direct messages from the bot.".to_owned()),
-        (_, Some(50006)) => Some("The message needs content, an embed, a sticker, a component or a file.".to_owned()),
-        (_, Some(50034)) => {
-            Some("Bulk delete only takes messages younger than 14 days; delete older ones one by one.".to_owned())
         }
-        (404, Some(10000..=10999)) => Some(
+        (_, Some(50035)) => {
+            named = format!("A field of the request is wrong; errors says which. {entry} lists the fields.");
+            &named
+        }
+        (_, Some(50007)) => "This user doesn't take direct messages from the bot.",
+        (_, Some(50006)) => "The message needs content, an embed, a sticker, a component or a file.",
+        (_, Some(50034)) => "Bulk delete only takes messages younger than 14 days; delete older ones one by one.",
+        (404, Some(10000..=10999)) => {
             "Discord knows no such thing by that id. Check the id, and that it is the kind of id this path takes."
-                .to_owned(),
-        ),
-        (403, _) => Some("The bot isn't allowed to do this here.".to_owned()),
-        (413, _) => Some("The upload is larger than this server allows.".to_owned()),
-        (400, _) => Some(format!("{entry} lists what this endpoint takes.")),
-        _ => None,
+        }
+        (403, _) => "The bot isn't allowed to do this here.",
+        (413, _) => "The upload is larger than this server allows.",
+        (400, _) => {
+            named = format!("{entry} lists what this endpoint takes.");
+            &named
+        }
+        _ => return out,
     };
-    if let Some(hint) = hint {
-        out.push('\n');
-        out.push_str(&hint);
-    }
+    out.push('\n');
+    out.push_str(hint);
     out
 }
 

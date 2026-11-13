@@ -3,12 +3,16 @@
 //! cached (`update`), not compiled in: until the first download finishes
 //! there is none, and callers wait for it.
 
+use std::cmp::Reverse;
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::Duration;
 
 use serde_json::Value;
 use tokio::sync::Notify;
+
+use crate::lock;
 
 /// The spec in use: from the cache, or just downloaded. `None` until one is loaded.
 static CURRENT: RwLock<Option<Arc<Spec>>> = RwLock::new(None);
@@ -24,13 +28,13 @@ pub fn current() -> Option<Arc<Spec>> {
 /// Put a spec (from the cache or just fetched) in use.
 pub fn replace(spec: Spec) {
     *CURRENT.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(spec));
-    *MISSING.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *lock(&MISSING) = None;
     CHANGED.notify_waiters();
 }
 
 /// Say that no spec is coming, and why: whoever waits for one hears it at once.
 pub fn unavailable(why: String) {
-    *MISSING.lock().unwrap_or_else(|e| e.into_inner()) = Some(why);
+    *lock(&MISSING) = Some(why);
     CHANGED.notify_waiters();
 }
 
@@ -44,7 +48,7 @@ pub async fn wait(patience: Duration) -> Result<Arc<Spec>, String> {
         if let Some(spec) = current() {
             return Ok(spec);
         }
-        if let Some(why) = MISSING.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        if let Some(why) = lock(&MISSING).clone() {
             return Err(why);
         }
         if tokio::time::timeout_at(deadline, changed).await.is_err() {
@@ -144,11 +148,17 @@ impl Operation {
     }
 
     fn matches(&self, concrete: &[&str]) -> bool {
-        self.segments.len() == concrete.len()
-            && self.segments.iter().zip(concrete).all(|(s, c)| match s {
-                Segment::Literal(l) => l == c,
-                Segment::Param(_) => true,
-            })
+        self.segments.len() == concrete.len() && self.segments.iter().zip(concrete).all(|(s, c)| s.matches(c))
+    }
+}
+
+impl Segment {
+    /// Does a part of a concrete path fit here? A parameter takes anything.
+    fn matches(&self, concrete: &str) -> bool {
+        match self {
+            Self::Literal(literal) => literal == concrete,
+            Self::Param(_) => true,
+        }
     }
 }
 
@@ -200,7 +210,7 @@ impl Spec {
                 nearest: self.nearest(&concrete),
             };
         };
-        let on_path: Vec<&Operation> = self.ops.iter().filter(|op| op.path == best.path).collect();
+        let on_path = self.on_template(&best.path);
         match on_path.iter().find(|op| op.method == method) {
             Some(op) => Route::Found(op),
             None => Route::WrongMethod {
@@ -216,10 +226,7 @@ impl Spec {
             op.segments
                 .iter()
                 .zip(concrete)
-                .take_while(|(s, c)| match s {
-                    Segment::Literal(l) => l == *c,
-                    Segment::Param(_) => true,
-                })
+                .take_while(|(s, c)| s.matches(c))
                 .count()
         };
         // Where the paths part ways, a misspelt word (`memberz`) still starts like the right one.
@@ -241,7 +248,7 @@ impl Spec {
             })
             .filter(|(shared, ..)| *shared > 0)
             .collect();
-        scored.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
+        scored.sort_by_key(|&(shared, alike, length_diff, _)| (Reverse(shared), Reverse(alike), length_diff));
         scored.into_iter().take(8).map(|(.., op)| op).collect()
     }
 
@@ -265,11 +272,7 @@ impl Spec {
             .map(|op| (op, keywords.iter().filter(|k| op.text.contains(k.as_str())).count()))
             .filter(|(_, n)| *n > 0 || keywords.is_empty())
             .collect();
-        found.sort_by(|a, b| {
-            b.1.cmp(&a.1)
-                .then(a.0.path.cmp(&b.0.path))
-                .then(a.0.method.cmp(b.0.method))
-        });
+        found.sort_by_key(|&(op, count)| (Reverse(count), op.path.as_str(), op.method));
         found
     }
 
@@ -397,34 +400,24 @@ fn percent_decode(text: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        match bytes[i] {
-            b'%' if i + 2 < bytes.len() && is_hex(bytes[i + 1]) && is_hex(bytes[i + 2]) => {
-                out.push(hex_value(bytes[i + 1]) << 4 | hex_value(bytes[i + 2]));
-                i += 3;
-            }
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b => {
-                out.push(b);
-                i += 1;
-            }
+        if let Some(byte) = escape_at(bytes, i) {
+            out.push(byte);
+            i += 3;
+            continue;
         }
+        out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
+        i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn is_hex(b: u8) -> bool {
-    b.is_ascii_hexdigit()
-}
-
-fn hex_value(b: u8) -> u8 {
-    match b {
-        b'0'..=b'9' => b - b'0',
-        b'a'..=b'f' => b - b'a' + 10,
-        _ => b - b'A' + 10,
-    }
+/// The byte a `%XX` escape starting at `i` stands for, if one does.
+fn escape_at(bytes: &[u8], i: usize) -> Option<u8> {
+    let [b'%', high, low] = *bytes.get(i..i + 3)? else {
+        return None;
+    };
+    let digit = |b: u8| char::from(b).to_digit(16);
+    Some((digit(high)? << 4 | digit(low)?) as u8)
 }
 
 /// Percent-encode what a path segment can't hold (an emoji in a reaction
@@ -432,16 +425,9 @@ fn hex_value(b: u8) -> u8 {
 fn encode_segment(segment: &str) -> String {
     let bytes = segment.as_bytes();
     let mut out = String::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        let escaped = b == b'%' && i + 2 < bytes.len() && is_hex(bytes[i + 1]) && is_hex(bytes[i + 2]);
-        if b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:@".contains(&b) || escaped {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-        i += 1;
+    for (i, &b) in bytes.iter().enumerate() {
+        let keep = b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:@".contains(&b) || escape_at(bytes, i).is_some();
+        push_encoded(&mut out, b, keep);
     }
     out
 }
@@ -450,13 +436,18 @@ fn encode_segment(segment: &str) -> String {
 pub fn encode_header(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for b in value.bytes() {
-        if b.is_ascii_alphanumeric() || b"-._~ ".contains(&b) {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
+        push_encoded(&mut out, b, b.is_ascii_alphanumeric() || b"-._~ ".contains(&b));
     }
     out
+}
+
+/// One byte of percent-encoded text: as it is when `keep` (always ASCII then), else `%XX`.
+fn push_encoded(out: &mut String, b: u8, keep: bool) {
+    if keep {
+        out.push(char::from(b));
+    } else {
+        let _ = write!(out, "%{b:02X}");
+    }
 }
 
 /// Distinct path templates, for telling an agent what exists under a prefix.

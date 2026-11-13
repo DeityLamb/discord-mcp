@@ -11,6 +11,7 @@ use reqwest::StatusCode;
 use reqwest::header::{ETAG, IF_NONE_MATCH};
 use serde::{Deserialize, Serialize};
 
+use crate::env_dir;
 use crate::spec::{self, Spec};
 
 pub const SPEC_URL: &str = "https://raw.githubusercontent.com/discord/discord-api-spec/main/specs/openapi.json";
@@ -39,17 +40,16 @@ pub enum Refresh {
 
 /// `DISCORD_MCP_CACHE_DIR`, or the platform's cache directory for discord-mcp.
 pub fn cache_dir() -> Option<PathBuf> {
-    let var = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty()).map(PathBuf::from);
-    if let Some(dir) = var("DISCORD_MCP_CACHE_DIR") {
+    if let Some(dir) = env_dir("DISCORD_MCP_CACHE_DIR") {
         return Some(dir);
     }
     if cfg!(windows) {
-        return var("LOCALAPPDATA").map(|d| d.join("discord-mcp").join("cache"));
+        return env_dir("LOCALAPPDATA").map(|d| d.join("discord-mcp").join("cache"));
     }
     if cfg!(target_os = "macos") {
         return std::env::home_dir().map(|h| h.join("Library").join("Caches").join("discord-mcp"));
     }
-    var("XDG_CACHE_HOME")
+    env_dir("XDG_CACHE_HOME")
         .or_else(|| std::env::home_dir().map(|h| h.join(".cache")))
         .map(|d| d.join("discord-mcp"))
 }

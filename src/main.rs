@@ -8,6 +8,7 @@
 //! machine share a background hub (started by the first, gone a minute after
 //! the last), so there is one gateway connection however many clients run.
 
+use std::io::{Read, Write};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,6 +19,8 @@ use discord_mcp::rest::{self, Rest};
 use discord_mcp::tools::{Options, Tools};
 use discord_mcp::{hub, mcp, pipe, update};
 use rmcp::ServiceExt;
+use rmcp::model::JsonObject;
+use serde_json::Value;
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -71,6 +74,9 @@ enum Command {
         key: String,
     },
 }
+
+/// Without a state directory there is nowhere for a hub's files.
+const NO_STATE_DIR: &str = "no directory to keep the hub's files in; set DISCORD_MCP_STATE_DIR";
 
 /// What comes from the environment and decides which bot this is and how it connects.
 struct Setup {
@@ -228,7 +234,7 @@ async fn serve(cli: &Cli) -> Result<ExitCode, String> {
 
 /// Be a pipe between the MCP client and the hub, starting the hub if this is the first session.
 async fn through_hub(cli: &Cli, setup: &Setup, token: &str) -> Result<pipe::End, String> {
-    let dir = hub::state_dir().ok_or("no directory to keep the hub's files in; set DISCORD_MCP_STATE_DIR")?;
+    let dir = hub::state_dir().ok_or(NO_STATE_DIR)?;
     let key = hub_key(setup, token);
     let mut hub_args = Vec::new();
     if cli.no_spec_update {
@@ -246,7 +252,7 @@ async fn be_hub(cli: &Cli, key: &str) -> Result<ExitCode, String> {
     let setup = setup(cli)?;
     let tools = tools(cli, &setup)?;
     let rest = tools.rest.ok_or("DISCORD_TOKEN isn't set")?;
-    let dir = hub::state_dir().ok_or("no directory to keep the hub's files in; set DISCORD_MCP_STATE_DIR")?;
+    let dir = hub::state_dir().ok_or(NO_STATE_DIR)?;
     let grace = env("DISCORD_MCP_HUB_GRACE")
         .and_then(|s| s.parse().ok())
         .map_or(hub::IDLE_GRACE, Duration::from_secs_f64);
@@ -266,58 +272,14 @@ async fn call(cli: &Cli, list: bool, tool: Option<&str>, args: Option<String>) -
     let setup = setup(cli)?;
     let tools = tools(cli, &setup)?;
     if list {
-        // Collected and written once: a reader that stops early (`| head`) ends this quietly.
-        let mut text = String::new();
-        for t in tools.definitions() {
-            text += &format!("{}\n  {}\n", t.name, t.description.as_deref().unwrap_or(""));
-            let required: Vec<&str> = t
-                .input_schema
-                .get("required")
-                .and_then(|r| r.as_array())
-                .map(|r| r.iter().filter_map(|v| v.as_str()).collect())
-                .unwrap_or_default();
-            if let Some(properties) = t.input_schema.get("properties").and_then(|p| p.as_object()) {
-                for (name, schema) in properties {
-                    let doc = schema.get("description").and_then(|d| d.as_str()).unwrap_or("");
-                    let must = if required.contains(&name.as_str()) {
-                        " (required)"
-                    } else {
-                        ""
-                    };
-                    text += &format!(
-                        "    {name}{must}: {}\n",
-                        doc.split_whitespace().collect::<Vec<_>>().join(" ")
-                    );
-                }
-            }
-        }
-        let _ = std::io::Write::write_all(&mut std::io::stdout(), text.as_bytes());
+        // Written at once: a reader that stops early (`| head`) ends this quietly.
+        let _ = std::io::stdout().write_all(tool_list(&tools).as_bytes());
         return Ok(ExitCode::SUCCESS);
     }
     let Some(tool) = tool else {
         return Err("needs a tool name, e.g. discord_docs (or --list to see them all)".into());
     };
-    let args = match args {
-        Some(s) if s == "-" => {
-            let mut text = String::new();
-            std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)
-                .map_err(|e| format!("reading json-args from stdin: {e}"))?;
-            Some(text)
-        }
-        Some(s) if s.starts_with('@') => {
-            Some(std::fs::read_to_string(&s[1..]).map_err(|e| format!("reading json-args from {}: {e}", &s[1..]))?)
-        }
-        other => other,
-    };
-    let args = match args {
-        None => None,
-        Some(s) => match serde_json::from_str::<serde_json::Value>(&s) {
-            Ok(serde_json::Value::Object(o)) => Some(o),
-            Ok(serde_json::Value::Null) => None,
-            Ok(_) => return Err("json-args must be a JSON object, e.g. '{\"path\": \"/users/@me\"}'".into()),
-            Err(e) => return Err(format!("json-args is not valid JSON: {e}")),
-        },
-    };
+    let args = call_args(args)?;
     reference(cli);
     let result = tools.call(tool, args).await;
     if let Some(gateway) = &tools.gateway {
@@ -333,4 +295,58 @@ async fn call(cli: &Cli, list: bool, tool: Option<&str>, args: Option<String>) -
     } else {
         ExitCode::SUCCESS
     })
+}
+
+/// `call --list`: each tool's name and description, then its arguments, one per line.
+fn tool_list(tools: &Tools) -> String {
+    let mut text = String::new();
+    for t in tools.definitions() {
+        text += &format!("{}\n  {}\n", t.name, t.description.as_deref().unwrap_or(""));
+        let required: Vec<&str> = t
+            .input_schema
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|r| r.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        let Some(properties) = t.input_schema.get("properties").and_then(Value::as_object) else {
+            continue;
+        };
+        for (name, schema) in properties {
+            let doc = schema.get("description").and_then(Value::as_str).unwrap_or("");
+            let must = if required.contains(&name.as_str()) {
+                " (required)"
+            } else {
+                ""
+            };
+            text += &format!(
+                "    {name}{must}: {}\n",
+                doc.split_whitespace().collect::<Vec<_>>().join(" ")
+            );
+        }
+    }
+    text
+}
+
+/// A call's json-args: given inline, read from a file (`@file`) or from stdin (`-`). `null` is none.
+fn call_args(args: Option<String>) -> Result<Option<JsonObject>, String> {
+    let text = match args {
+        None => return Ok(None),
+        Some(dash) if dash == "-" => {
+            let mut text = String::new();
+            std::io::stdin()
+                .read_to_string(&mut text)
+                .map_err(|e| format!("reading json-args from stdin: {e}"))?;
+            text
+        }
+        Some(text) => match text.strip_prefix('@') {
+            Some(file) => std::fs::read_to_string(file).map_err(|e| format!("reading json-args from {file}: {e}"))?,
+            None => text,
+        },
+    };
+    match serde_json::from_str::<Value>(&text) {
+        Ok(Value::Object(object)) => Ok(Some(object)),
+        Ok(Value::Null) => Ok(None),
+        Ok(_) => Err("json-args must be a JSON object, e.g. '{\"path\": \"/users/@me\"}'".into()),
+        Err(e) => Err(format!("json-args is not valid JSON: {e}")),
+    }
 }

@@ -14,7 +14,8 @@ use tokio::sync::{Notify, mpsc};
 use twilight_gateway::{CloseFrame, ConfigBuilder, Intents, Message, MessageSender, Shard, ShardId};
 
 use crate::events::EventLog;
-use crate::rest::{Body, Layout, Request, Rest};
+use crate::lock;
+use crate::rest::{self, Body, Layout, Request, Rest};
 
 /// How soon after Discord closed the session for good a new one may be tried: each try spends one
 /// of the bot's 1000 daily identifies.
@@ -165,9 +166,8 @@ pub struct Gateway {
 
 impl Gateway {
     pub fn new(token: &str, rest: Arc<Rest>, intents: IntentChoice, url: Option<String>) -> Arc<Self> {
-        let token = token.trim();
         Arc::new(Self {
-            token: token.strip_prefix("Bot ").unwrap_or(token).trim().to_owned(),
+            token: rest::bare_token(token).to_owned(),
             rest,
             intents,
             url,
@@ -185,18 +185,18 @@ impl Gateway {
     }
 
     pub fn state(&self) -> State {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        lock(&self.state).clone()
     }
 
     fn set(&self, state: State) {
-        *self.state.lock().unwrap_or_else(|e| e.into_inner()) = state;
+        *lock(&self.state) = state;
         self.state_changed.notify_waiters();
     }
 
     /// Open the session if there is none. Says whether this call started it.
     pub fn start(self: &Arc<Self>) -> bool {
         {
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = lock(&self.state);
             match &*state {
                 State::Idle => {}
                 State::Closed { at, .. } if at.elapsed() >= RETRY_AFTER => {}
@@ -254,7 +254,7 @@ impl Gateway {
     }
 
     fn send(&self, op: u8, data: &Value) -> Result<(), String> {
-        let sender = self.sender.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let sender = lock(&self.sender).clone();
         let sender = sender.ok_or("The gateway connection isn't open.")?;
         sender
             .send(json!({"op": op, "d": data}).to_string())
@@ -266,7 +266,7 @@ impl Gateway {
     pub async fn set_presence(self: &Arc<Self>, presence: Value) -> Result<Value, String> {
         let presence = presence_payload(presence)?;
         self.ready().await?;
-        *self.presence.lock().unwrap_or_else(|e| e.into_inner()) = Some(presence.clone());
+        *lock(&self.presence) = Some(presence.clone());
         self.send(OP_PRESENCE_UPDATE, &presence)?;
         Ok(presence)
     }
@@ -290,10 +290,7 @@ impl Gateway {
         let nonce = format!("mcp-{}", self.nonces.fetch_add(1, Ordering::Relaxed));
         request.insert("nonce".into(), json!(nonce));
         let (tx, mut rx) = mpsc::unbounded_channel();
-        self.member_requests
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(nonce.clone(), tx);
+        lock(&self.member_requests).insert(nonce.clone(), tx);
         let gathered = async {
             self.send(OP_REQUEST_GUILD_MEMBERS, &Value::Object(request))?;
             let mut members = Vec::new();
@@ -325,10 +322,7 @@ impl Gateway {
             Ok::<Value, String>(out)
         };
         let result = tokio::time::timeout(MEMBERS_TIMEOUT, gathered).await;
-        self.member_requests
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&nonce);
+        lock(&self.member_requests).remove(&nonce);
         match result {
             Ok(result) => result,
             Err(_) => Err(format!(
@@ -410,7 +404,7 @@ impl Gateway {
             config = config.proxy_url(url.clone());
         }
         let mut shard = Shard::with_config(ShardId::ONE, config.build());
-        *self.sender.lock().unwrap_or_else(|e| e.into_inner()) = Some(shard.sender());
+        *lock(&self.sender) = Some(shard.sender());
         let mut last_close = None;
         loop {
             let next = tokio::select! {
@@ -473,10 +467,10 @@ impl Gateway {
             "READY" => {
                 let user = data["user"]["username"].as_str().unwrap_or("the bot").to_owned();
                 let guilds = data["guilds"].as_array().map_or(0, Vec::len);
-                *self.identity.lock().unwrap_or_else(|e| e.into_inner()) = Some((user.clone(), guilds));
+                *lock(&self.identity) = Some((user.clone(), guilds));
                 self.arrived.store(0, Ordering::Relaxed);
                 // A new session starts with the presence it identified with: set ours again.
-                let presence = self.presence.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let presence = lock(&self.presence).clone();
                 if let Some(presence) = presence
                     && let Err(e) = self.send(OP_PRESENCE_UPDATE, &presence)
                 {
@@ -485,7 +479,7 @@ impl Gateway {
                 self.set(State::Ready { user, guilds });
             }
             "RESUMED" => {
-                let identity = self.identity.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let identity = lock(&self.identity).clone();
                 let (user, guilds) = identity.unwrap_or_else(|| ("the bot".into(), 0));
                 self.set(State::Ready { user, guilds });
             }
@@ -495,7 +489,7 @@ impl Gateway {
             // An answer to a member request goes to whoever asked, not into everyone's events.
             "GUILD_MEMBERS_CHUNK" => {
                 if let Some(nonce) = data["nonce"].as_str() {
-                    let waiting = self.member_requests.lock().unwrap_or_else(|e| e.into_inner());
+                    let waiting = lock(&self.member_requests);
                     if let Some(tx) = waiting.get(nonce) {
                         let _ = tx.send(data);
                         return;

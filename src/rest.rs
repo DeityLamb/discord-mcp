@@ -9,6 +9,7 @@ use reqwest::multipart::{Form, Part};
 use reqwest::{Method, StatusCode};
 use serde_json::Value;
 
+use crate::filter;
 use crate::ratelimit::{Observed, RateLimiter};
 use crate::spec::encode_header;
 
@@ -101,8 +102,7 @@ impl std::fmt::Display for RestError {
 impl Rest {
     /// `token` is the bot token, with or without the `Bot ` in front.
     pub fn new(token: &str, base: &str, patience: Duration) -> Result<Self, String> {
-        let token = token.trim();
-        let token = token.strip_prefix("Bot ").unwrap_or(token).trim();
+        let token = bare_token(token);
         if token.is_empty() || token.chars().any(|c| c.is_whitespace() || c.is_control()) {
             return Err("the bot token is empty or has spaces in it".into());
         }
@@ -142,25 +142,23 @@ impl Rest {
             let response = match self.build(request)?.send().await {
                 Ok(response) => response,
                 Err(e) if retryable && (e.is_connect() || e.is_timeout()) => {
-                    tokio::time::sleep(Duration::from_millis(500 * u64::from(attempts))).await;
+                    back_off(attempts).await;
                     continue;
                 }
                 Err(e) => return Err(RestError::Transport(describe(&e))),
             };
             let status = response.status();
-            let headers = response.headers().clone();
-            self.limits
-                .observe(&request.bucket, &observed(&headers), Instant::now());
+            let headers = response.headers();
+            self.limits.observe(&request.bucket, &observed(headers), Instant::now());
             if status == StatusCode::TOO_MANY_REQUESTS {
+                // Taken before the body, which consumes the response.
+                let header_seconds = header_number(headers, RETRY_AFTER.as_str());
+                let header_global = header_text(headers, "x-ratelimit-global") == Some("true")
+                    || header_text(headers, "x-ratelimit-scope") == Some("global");
                 // Discord's own 429 has a JSON body; one from the network edge in front of it has only the header.
                 let body: Value = response.json().await.unwrap_or(Value::Null);
-                let seconds = body["retry_after"]
-                    .as_f64()
-                    .or_else(|| header_number(&headers, RETRY_AFTER.as_str()))
-                    .unwrap_or(1.0);
-                let global = body["global"].as_bool().unwrap_or(false)
-                    || header_text(&headers, "x-ratelimit-global") == Some("true")
-                    || header_text(&headers, "x-ratelimit-scope") == Some("global");
+                let seconds = body["retry_after"].as_f64().or(header_seconds).unwrap_or(1.0);
+                let global = body["global"].as_bool().unwrap_or(false) || header_global;
                 let retry_after = Duration::from_secs_f64(seconds.clamp(0.0, 3600.0));
                 self.limits
                     .limited(&request.bucket, retry_after, global, Instant::now());
@@ -170,10 +168,10 @@ impl Rest {
                 continue;
             }
             if status.is_server_error() && retryable {
-                tokio::time::sleep(Duration::from_millis(500 * u64::from(attempts))).await;
+                back_off(attempts).await;
                 continue;
             }
-            let body = read(response, &headers).await?;
+            let body = read(response).await?;
             return Ok(Response { status, body, waited });
         }
     }
@@ -206,11 +204,7 @@ impl Rest {
                 }
                 (Some(Value::Object(fields)), Layout::Fields) => {
                     for (name, value) in fields {
-                        let text = match value {
-                            Value::String(s) => s.clone(),
-                            other => other.to_string(),
-                        };
-                        form = form.text(name.clone(), text);
+                        form = form.text(name.clone(), filter::plain(value));
                     }
                 }
                 _ => {}
@@ -231,6 +225,13 @@ impl Rest {
         }
         Ok(builder)
     }
+}
+
+/// The token without the `Bot ` an agent or a copied header may have put in front, and without spaces
+/// around it.
+pub fn bare_token(token: &str) -> &str {
+    let token = token.trim();
+    token.strip_prefix("Bot ").unwrap_or(token).trim()
 }
 
 fn user_agent() -> String {
@@ -258,8 +259,13 @@ fn observed(headers: &HeaderMap) -> Observed {
     }
 }
 
-async fn read(response: reqwest::Response, headers: &HeaderMap) -> Result<Body, RestError> {
-    let content_type = header_text(headers, CONTENT_TYPE.as_str())
+/// The pause before retrying a GET that failed: longer after each attempt.
+async fn back_off(attempts: u32) {
+    tokio::time::sleep(Duration::from_millis(500 * u64::from(attempts))).await;
+}
+
+async fn read(response: reqwest::Response) -> Result<Body, RestError> {
+    let content_type = header_text(response.headers(), CONTENT_TYPE.as_str())
         .unwrap_or_default()
         .to_owned();
     let bytes = response.bytes().await.map_err(|e| RestError::Transport(describe(&e)))?;

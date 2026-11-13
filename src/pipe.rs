@@ -70,10 +70,7 @@ async fn greet(dir: &Path, key: &str, options: &Options) -> Result<TcpStream, St
         secret: file.secret,
         options: options.clone(),
     };
-    let mut line = serde_json::to_vec(&hello).map_err(|e| e.to_string())?;
-    line.push(b'\n');
-    stream
-        .write_all(&line)
+    hub::write_line(&mut stream, &hello)
         .await
         .map_err(|e| format!("saying hello: {e}"))?;
     let answer = tokio::time::timeout(WELCOME_TIMEOUT, hub::read_line(&mut stream, hub::MAX_HELLO))

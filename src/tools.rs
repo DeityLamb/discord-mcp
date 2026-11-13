@@ -35,6 +35,8 @@ const MAX_EVENTS: u32 = 500;
 const MAX_WAIT: u32 = 300;
 /// Longest a call waits for the API reference on a first start, while it downloads.
 const SPEC_WAIT: Duration = Duration::from_secs(30);
+/// The answer to a write under `--read-only`.
+const READ_ONLY: &str = "This server runs read-only (--read-only): nothing on Discord can be changed through it.";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Options {
@@ -168,13 +170,13 @@ enum WriteMethod {
     Delete,
 }
 
-impl WriteMethod {
-    fn method(self) -> Method {
-        match self {
-            Self::Post => Method::POST,
-            Self::Put => Method::PUT,
-            Self::Patch => Method::PATCH,
-            Self::Delete => Method::DELETE,
+impl From<WriteMethod> for Method {
+    fn from(method: WriteMethod) -> Self {
+        match method {
+            WriteMethod::Post => Self::POST,
+            WriteMethod::Put => Self::PUT,
+            WriteMethod::Patch => Self::PATCH,
+            WriteMethod::Delete => Self::DELETE,
         }
     }
 }
@@ -327,63 +329,25 @@ pub fn definitions(options: &Options, events: bool) -> Vec<Tool> {
 
 impl Tools {
     pub async fn call(&self, name: &str, args: Option<JsonObject>) -> CallToolResult {
-        let args = Value::Object(args.unwrap_or_default());
-        let result = match name {
-            DOCS => match parse::<DocsArgs>(args) {
-                Ok(a) => self.docs(a).await,
-                Err(e) => Err(e),
-            },
-            GET => match parse::<GetArgs>(args) {
-                Ok(a) => {
-                    let wanted = Wanted {
-                        method: Method::GET,
-                        path: a.path,
-                        query: a.query,
-                        body: None,
-                        files: Vec::new(),
-                        reason: None,
-                        jq: a.jq,
-                    };
-                    self.request(wanted).await
-                }
-                Err(e) => Err(e),
-            },
-            CALL if self.options.read_only => {
-                Err("This server runs read-only (--read-only): nothing on Discord can be changed through it.".into())
-            }
-            CALL => match parse::<CallArgs>(args) {
-                Ok(a) => {
-                    let wanted = Wanted {
-                        method: a.method.method(),
-                        path: a.path,
-                        query: a.query,
-                        body: a.body,
-                        files: a.files,
-                        reason: a.reason,
-                        jq: a.jq,
-                    };
-                    self.request(wanted).await
-                }
-                Err(e) => Err(e),
-            },
-            EVENTS => match parse::<EventsArgs>(args) {
-                Ok(a) => self.events(a).await,
-                Err(e) => Err(e),
-            },
-            GATEWAY if self.options.read_only => {
-                Err("This server runs read-only (--read-only): nothing on Discord can be changed through it.".into())
-            }
-            GATEWAY => match parse::<GatewayArgs>(args) {
-                Ok(a) => self.gateway_command(a).await,
-                Err(e) => Err(e),
-            },
+        let result = self.dispatch(name, Value::Object(args.unwrap_or_default())).await;
+        let text = |text| vec![ContentBlock::text(filter::cap(text, self.options.max_output))];
+        match result {
+            Ok(answer) => CallToolResult::success(text(answer)),
+            Err(error) => CallToolResult::error(text(error)),
+        }
+    }
+
+    async fn dispatch(&self, name: &str, args: Value) -> Result<String, String> {
+        match name {
+            CALL | GATEWAY if self.options.read_only => Err(READ_ONLY.into()),
+            DOCS => self.docs(parse(args)?).await,
+            GET => self.request(parse::<GetArgs>(args)?.into()).await,
+            CALL => self.request(parse::<CallArgs>(args)?.into()).await,
+            EVENTS => self.events(parse(args)?).await,
+            GATEWAY => self.gateway_command(parse(args)?).await,
             other => Err(format!(
                 "No tool is named {other}. There are {DOCS}, {GET}, {CALL}, {EVENTS} and {GATEWAY}."
             )),
-        };
-        match result {
-            Ok(text) => CallToolResult::success(vec![ContentBlock::text(filter::cap(text, self.options.max_output))]),
-            Err(text) => CallToolResult::error(vec![ContentBlock::text(filter::cap(text, self.options.max_output))]),
         }
     }
 
@@ -735,6 +699,34 @@ struct Wanted {
     files: Vec<FileArg>,
     reason: Option<String>,
     jq: Option<String>,
+}
+
+impl From<GetArgs> for Wanted {
+    fn from(args: GetArgs) -> Self {
+        Self {
+            method: Method::GET,
+            path: args.path,
+            query: args.query,
+            body: None,
+            files: Vec::new(),
+            reason: None,
+            jq: args.jq,
+        }
+    }
+}
+
+impl From<CallArgs> for Wanted {
+    fn from(args: CallArgs) -> Self {
+        Self {
+            method: args.method.into(),
+            path: args.path,
+            query: args.query,
+            body: args.body,
+            files: args.files,
+            reason: args.reason,
+            jq: args.jq,
+        }
+    }
 }
 
 fn non_empty(text: &Option<String>) -> Option<&str> {

@@ -197,15 +197,15 @@ pub fn render_operation(spec: &Spec, op: &Operation) -> String {
     if let Some(d) = &op.description {
         out.push_str(&format!("\n{d}"));
     }
-    for (place, label) in [("path", "path"), ("query", "query")] {
-        let lines: Vec<String> = op
-            .parameters(spec)
-            .into_iter()
+    let parameters = op.parameters(spec);
+    for place in ["path", "query"] {
+        let lines: Vec<String> = parameters
+            .iter()
             .filter(|p| p["in"] == place)
             .map(|p| parameter_line(spec, p))
             .collect();
         if !lines.is_empty() {
-            out.push_str(&format!("\n{label}:\n{}", lines.join("\n")));
+            out.push_str(&format!("\n{place}:\n{}", lines.join("\n")));
         }
     }
     let content = &object["requestBody"]["content"];
@@ -244,12 +244,7 @@ fn parameter_line(spec: &Spec, parameter: &Value) -> String {
         Some(d) if !d.trim().is_empty() => format!(" — {}", d.trim()),
         _ => String::new(),
     };
-    let range = match (&schema["minimum"], &schema["maximum"]) {
-        (Value::Number(min), Value::Number(max)) => format!(" ({min}..{max})"),
-        (_, Value::Number(max)) => format!(" (max {max})"),
-        (Value::Number(min), _) => format!(" (min {min})"),
-        _ => String::new(),
-    };
+    let range = schema::range(schema).map(|r| format!(" ({r})")).unwrap_or_default();
     format!(
         "  {}{optional}: {}{range}{description}",
         parameter["name"].as_str().unwrap_or("?"),

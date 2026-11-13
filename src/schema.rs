@@ -91,12 +91,17 @@ fn base_type(spec: &Spec, name: &str, schema: &Value) -> String {
             Some(values @ Value::Object(_)) => format!("{{[key]: {}}}", type_expr(spec, values)),
             _ => "object".into(),
         },
-        "string" => match schema["format"].as_str() {
-            Some("snowflake") => "snowflake".into(),
-            Some(format) => format!("string<{format}>"),
-            None => "string".into(),
-        },
+        "string" => string_type(schema),
         other => other.to_owned(),
+    }
+}
+
+/// A string by its format: `snowflake`, `string<date-time>`, or plain `string`.
+fn string_type(schema: &Value) -> String {
+    match schema["format"].as_str() {
+        Some("snowflake") => "snowflake".into(),
+        Some(format) => format!("string<{format}>"),
+        None => "string".into(),
     }
 }
 
@@ -107,11 +112,7 @@ fn scalar(schema: &Value) -> Option<String> {
         .iter()
         .all(|k| schema.get(k).is_none());
     (plain && ["string", "integer", "number", "boolean"].contains(&name)).then(|| match name {
-        "string" => match schema["format"].as_str() {
-            Some("snowflake") => "snowflake".into(),
-            Some(format) => format!("string<{format}>"),
-            None => "string".into(),
-        },
+        "string" => string_type(schema),
         other => other.to_owned(),
     })
 }
@@ -119,29 +120,39 @@ fn scalar(schema: &Value) -> Option<String> {
 /// Length, range and size limits: ` (max 4000 chars)`, ` (1..100)`.
 fn limits(schema: &Value) -> String {
     let int = |key: &str| schema[key].as_i64();
-    let mut parts = Vec::new();
-    match (int("minLength"), int("maxLength")) {
-        (Some(min), Some(max)) if min > 0 => parts.push(format!("{min}..{max} chars")),
-        (_, Some(max)) => parts.push(format!("max {max} chars")),
-        (Some(min), None) if min > 0 => parts.push(format!("min {min} chars")),
-        _ => {}
-    }
-    match (&schema["minimum"], &schema["maximum"]) {
-        (Value::Number(min), Value::Number(max)) => parts.push(format!("{min}..{max}")),
-        (Value::Number(min), _) => parts.push(format!("min {min}")),
-        (_, Value::Number(max)) => parts.push(format!("max {max}")),
-        _ => {}
-    }
-    match (int("minItems"), int("maxItems")) {
-        (Some(min), Some(max)) if min > 0 => parts.push(format!("{min}..{max} items")),
-        (_, Some(max)) => parts.push(format!("max {max} items")),
-        (Some(min), None) if min > 0 => parts.push(format!("min {min} items")),
-        _ => {}
-    }
+    let parts: Vec<String> = [
+        count_limit(int("minLength"), int("maxLength"), "chars"),
+        range(schema),
+        count_limit(int("minItems"), int("maxItems"), "items"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     if parts.is_empty() {
         String::new()
     } else {
         format!(" ({})", parts.join(", "))
+    }
+}
+
+/// The bounds of a number: `1..100`, `min 0`, `max 25`.
+pub fn range(schema: &Value) -> Option<String> {
+    match (&schema["minimum"], &schema["maximum"]) {
+        (Value::Number(min), Value::Number(max)) => Some(format!("{min}..{max}")),
+        (Value::Number(min), _) => Some(format!("min {min}")),
+        (_, Value::Number(max)) => Some(format!("max {max}")),
+        _ => None,
+    }
+}
+
+/// The bounds of a length or a size, in `unit`s: `1..100 items`, `max 4000 chars`. A minimum of 0
+/// says nothing.
+fn count_limit(min: Option<i64>, max: Option<i64>, unit: &str) -> Option<String> {
+    match (min.filter(|&min| min > 0), max) {
+        (Some(min), Some(max)) => Some(format!("{min}..{max} {unit}")),
+        (None, Some(max)) => Some(format!("max {max} {unit}")),
+        (Some(min), None) => Some(format!("min {min} {unit}")),
+        (None, None) => None,
     }
 }
 

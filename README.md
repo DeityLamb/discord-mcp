@@ -1,6 +1,6 @@
 # discord-mcp
 
-An MCP server that gives an agent the whole Discord API through four tools, acting as your bot.
+An MCP server that gives an agent the whole Discord API through five tools, acting as your bot.
 
 | Tool | What it does |
 | --- | --- |
@@ -8,6 +8,7 @@ An MCP server that gives an agent the whole Discord API through four tools, acti
 | `discord_get` | Any `GET` endpoint. Read-only, so a client can allow it without asking. |
 | `discord_call` | Any `POST`, `PUT`, `PATCH` or `DELETE` endpoint, with file uploads and an audit-log reason. |
 | `discord_events` | What happens as it happens (messages, reactions, members joining), from the gateway. |
+| `discord_gateway` | Gateway commands: set the bot's status and activity, look up members with their online status. |
 
 There is no tool per endpoint. The agent finds the endpoint in `discord_docs`, then calls it; a `jq`
 argument on every call keeps long responses out of its context.
@@ -18,13 +19,20 @@ argument on every call keeps long responses out of its context.
    bot token from its **Bot** page. Invite the bot to your server with the permissions you want it to have.
 2. To read what other people write, switch on **Message Content Intent** on the same page. To list
    members, switch on **Server Members Intent**.
-3. Build and install:
+3. Install: download a binary for your platform from
+   [Releases](https://github.com/DeityLamb/discord-mcp/releases), or build it:
 
    ```sh
-   cargo install --path .
+   cargo install --git https://github.com/DeityLamb/discord-mcp
    ```
 
-4. Add it to your MCP client with the token in its environment:
+4. Add it to your MCP client with the token in its environment. For Claude Code:
+
+   ```sh
+   claude mcp add discord -s user -e DISCORD_TOKEN=<bot token> -- discord-mcp
+   ```
+
+   Or in a client's JSON config:
 
    ```json
    {
@@ -43,8 +51,8 @@ Without a token the server still starts, and `discord_docs` works.
 
 | Flag | Effect |
 | --- | --- |
-| `--read-only` | Leaves out `discord_call`: nothing on Discord can be changed. |
-| `--disable-gateway` | No `discord_events`, no background hub, and the bot stays offline. |
+| `--read-only` | Leaves out `discord_call` and `discord_gateway`: nothing on Discord can be changed. |
+| `--disable-gateway` | No `discord_events` or `discord_gateway`, no background hub, and the bot stays offline. |
 | `--intents <list>` | Gateway intents by name, e.g. `guilds,guild_messages,message_content`. By default: all but typing and presences, plus the privileged ones the bot has switched on. |
 | `--no-hub` | Keeps the gateway in the session's own process instead of sharing a hub. |
 | `--allow-unlisted` | Also sends requests to paths the API reference doesn't list. |
@@ -70,6 +78,8 @@ client 3 ── stdio ── discord-mcp ─┘
 - It leaves a minute after its last session, saying goodbye to Discord so the bot goes offline.
 - The gateway connects on the first `discord_events` call, so sessions that only use REST never open it.
 - Sessions keep their own options: one can be `--read-only` while another is not.
+- The bot has one presence: a status set by one session is what every session's bot shows, and it
+  stays set across reconnects until changed.
 
 ## Waiting for something
 
@@ -104,7 +114,7 @@ and then wait for the response:
 
 ## Not supported
 
-Voice, sharding (bots in 2500 or more servers), and sending gateway commands such as presence updates.
+Voice, and sharding (bots in 2500 or more servers).
 
 ## Development
 

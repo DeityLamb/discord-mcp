@@ -29,6 +29,8 @@ struct Discord {
     intents: Mutex<Option<u64>>,
     /// Close codes clients left with.
     closes: Mutex<Vec<u16>>,
+    /// Presence updates received.
+    presences: Mutex<Vec<Value>>,
     /// Events to send to every connected client.
     events: broadcast::Sender<Value>,
     rest_hits: AtomicUsize,
@@ -89,6 +91,27 @@ async fn session(mut socket: WebSocket, discord: Arc<Discord>) {
                         Some(1) => {
                             let _ = socket.send(text(json!({"op": 11}))).await;
                         }
+                        Some(3) => discord.presences.lock().unwrap().push(payload["d"].clone()),
+                        // Member request: answered in two chunks, after a chunk meant for someone else.
+                        Some(8) => {
+                            let nonce = payload["d"]["nonce"].clone();
+                            let chunks = [
+                                json!({"guild_id": "1", "members": [{"user": {"id": "0"}}], "chunk_index": 0,
+                                    "chunk_count": 1, "nonce": "someone else"}),
+                                json!({"guild_id": "1", "members": [{"user": {"id": "7", "username": "ann"}}],
+                                    "presences": [{"user": {"id": "7"}, "status": "idle"}], "chunk_index": 0,
+                                    "chunk_count": 2, "nonce": nonce}),
+                                json!({"guild_id": "1", "members": [{"user": {"id": "8", "username": "bo"}}],
+                                    "not_found": [], "chunk_index": 1, "chunk_count": 2, "nonce": nonce}),
+                            ];
+                            for chunk in chunks {
+                                seq += 1;
+                                let dispatch = json!({"op": 0, "t": "GUILD_MEMBERS_CHUNK", "s": seq, "d": chunk});
+                                if socket.send(text(dispatch)).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -118,6 +141,7 @@ async fn discord() -> Arc<Discord> {
         identifies: AtomicUsize::new(0),
         intents: Mutex::new(None),
         closes: Mutex::new(Vec::new()),
+        presences: Mutex::new(Vec::new()),
         events: broadcast::channel(64).0,
         rest_hits: AtomicUsize::new(0),
         port,
@@ -282,7 +306,13 @@ async fn sessions_share_one_hub_one_connection_and_every_event() {
     assert_eq!(hub_files(state.path()).len(), 1, "one hub for the three of them");
     assert_eq!(
         a.tool_names().await,
-        ["discord_docs", "discord_get", "discord_call", "discord_events"]
+        [
+            "discord_docs",
+            "discord_get",
+            "discord_call",
+            "discord_events",
+            "discord_gateway"
+        ]
     );
     // Each session keeps its own options, though the hub is shared.
     assert_eq!(c.tool_names().await, ["discord_docs", "discord_get", "discord_events"]);
@@ -445,4 +475,59 @@ async fn a_session_can_keep_the_gateway_to_itself() {
         discord.closes.lock().unwrap().contains(&1000)
     })
     .await;
+}
+
+#[tokio::test]
+async fn gateway_commands_set_the_presence_and_gather_member_chunks() {
+    let discord = discord().await;
+    let state = tempfile::tempdir().unwrap();
+    let mut client = Client::start(&discord, state.path(), &[]).await;
+    assert!(client.tool_names().await.contains(&"discord_gateway".to_owned()));
+
+    let (failed, set) = client
+        .tool(
+            "discord_gateway",
+            json!({"op": "update_presence", "data": {"status": "idle", "activities": [{"type": 4, "state": "testing"}]}}),
+        )
+        .await;
+    assert!(!failed, "{set}");
+    eventually("the presence reaches the gateway", || {
+        !discord.presences.lock().unwrap().is_empty()
+    })
+    .await;
+    let presence = discord.presences.lock().unwrap()[0].clone();
+    assert_eq!(presence["status"], "idle");
+    assert_eq!(presence["activities"][0]["state"], "testing");
+    assert_eq!(presence["activities"][0]["name"], "Custom Status");
+
+    let (_, before) = client.tool("discord_events", json!({})).await;
+    let (failed, members) = client
+        .tool(
+            "discord_gateway",
+            json!({"op": "request_guild_members", "data": {"guild_id": "1", "presences": true},
+                "jq": "[.members[].user.username, .presences[0].status] | join(\",\")"}),
+        )
+        .await;
+    assert!(!failed, "{members}");
+    assert_eq!(members, "ann,bo,idle");
+    // The answer went to the caller; only the chunk nobody here asked for is an event.
+    let (_, after) = client
+        .tool(
+            "discord_events",
+            json!({"after": cursor_of(&before), "types": ["GUILD_MEMBERS_CHUNK"]}),
+        )
+        .await;
+    assert_eq!(after.matches("GUILD_MEMBERS_CHUNK").count(), 1, "{after}");
+    assert!(after.contains("someone else"), "{after}");
+
+    let (failed, bad) = client
+        .tool(
+            "discord_gateway",
+            json!({"op": "update_presence", "data": {"status": "busy"}}),
+        )
+        .await;
+    assert!(failed && bad.contains("online, idle, dnd or invisible"), "{bad}");
+
+    let mut read_only = Client::start(&discord, state.path(), &["--read-only"]).await;
+    assert!(!read_only.tool_names().await.contains(&"discord_gateway".to_owned()));
 }

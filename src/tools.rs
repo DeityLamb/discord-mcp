@@ -22,6 +22,7 @@ pub const DOCS: &str = "discord_docs";
 pub const GET: &str = "discord_get";
 pub const CALL: &str = "discord_call";
 pub const EVENTS: &str = "discord_events";
+pub const GATEWAY: &str = "discord_gateway";
 
 /// Most files one call uploads; Discord takes 10 on a message.
 const MAX_FILES: usize = 10;
@@ -122,6 +123,31 @@ struct EventsArgs {
     limit: Option<u32>,
     /// A jq filter that shapes each event's data for the answer: `"\(.author.username): \(.content)"`.
     jq: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GatewayArgs {
+    /// update_presence: the bot's status and activity. request_guild_members: a server's members (with
+    /// presences if asked), which REST can't give with presences.
+    op: GatewayOp,
+    /// What the command takes. update_presence: {"status": "online" | "idle" | "dnd" | "invisible",
+    /// "activities": [{"type": 4, "state": "Reviewing pull requests"}]}; activity types: 0 playing, 1 streaming
+    /// (with url), 2 listening, 3 watching, 4 custom status (text in state), 5 competing. request_guild_members:
+    /// {"guild_id": "…", "query": "name prefix", "limit": 10} or {"guild_id": "…", "user_ids": ["…"]}, with
+    /// "presences": true for their statuses. Without query or user_ids: every member.
+    #[serde(default, deserialize_with = "lenient_body")]
+    #[schemars(with = "Option<Value>")]
+    data: Option<Value>,
+    /// A jq filter over the answer: ".members[] | {id: .user.id, name: .user.username}".
+    jq: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum GatewayOp {
+    UpdatePresence,
+    RequestGuildMembers,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
@@ -261,6 +287,20 @@ pub fn definitions(options: &Options, events: bool) -> Vec<Tool> {
              and the bot shows as online from then.",
             ToolAnnotations::new().read_only(true).open_world(true),
         ));
+        if !options.read_only {
+            tools.push(tool::<GatewayArgs>(
+                GATEWAY,
+                "Commands that go over the bot's gateway connection instead of REST. update_presence sets the \
+                 bot's status (online, idle, do not disturb, invisible) and activity (playing, listening, a \
+                 custom status...), which everyone sees and which stays until changed. request_guild_members \
+                 looks members up by name prefix or id, with their online status if asked: listing a whole \
+                 server needs the Server Members intent, statuses the Presence intent.",
+                ToolAnnotations::new()
+                    .destructive(false)
+                    .idempotent(true)
+                    .open_world(true),
+            ));
+        }
     }
     tools
 }
@@ -307,8 +347,15 @@ impl Tools {
                 Ok(a) => self.events(a).await,
                 Err(e) => Err(e),
             },
+            GATEWAY if self.options.read_only => {
+                Err("This server runs read-only (--read-only): nothing on Discord can be changed through it.".into())
+            }
+            GATEWAY => match parse::<GatewayArgs>(args) {
+                Ok(a) => self.gateway_command(a).await,
+                Err(e) => Err(e),
+            },
             other => Err(format!(
-                "No tool is named {other}. There are {DOCS}, {GET}, {CALL} and {EVENTS}."
+                "No tool is named {other}. There are {DOCS}, {GET}, {CALL}, {EVENTS} and {GATEWAY}."
             )),
         };
         match result {
@@ -321,16 +368,55 @@ impl Tools {
         definitions(&self.options, self.gateway.is_some())
     }
 
+    fn no_gateway(&self) -> String {
+        if self.rest.is_none() {
+            "No bot token: set DISCORD_TOKEN in this server's environment, then reconnect.".to_owned()
+        } else {
+            "This server runs without the gateway (--disable-gateway), so there are no events or gateway \
+             commands. REST still answers what happened: recent messages with GET /channels/{channel_id}/messages."
+                .to_owned()
+        }
+    }
+
+    async fn gateway_command(&self, args: GatewayArgs) -> Result<String, String> {
+        let Some(gateway) = &self.gateway else {
+            return Err(self.no_gateway());
+        };
+        let data = args.data.unwrap_or_else(|| Value::Object(Map::new()));
+        match args.op {
+            GatewayOp::UpdatePresence => {
+                let presence = gateway.set_presence(data).await?;
+                Ok(format!(
+                    "Presence set: {}. It stays until changed, while the connection is open.",
+                    filter::compact(&presence)
+                ))
+            }
+            GatewayOp::RequestGuildMembers => {
+                let members = gateway.request_members(data).await?;
+                self.shape(members, args.jq).await
+            }
+        }
+    }
+
+    /// JSON for the answer: compact, or through the caller's jq filter.
+    async fn shape(&self, value: Value, jq: Option<String>) -> Result<String, String> {
+        let Some(program) = jq.filter(|f| !f.trim().is_empty()) else {
+            return Ok(filter::compact(&value));
+        };
+        let max = self.options.max_output;
+        // A filter is someone else's program: it runs off the async threads and under a clock.
+        let run = tokio::task::spawn_blocking(move || filter::jq(&program, &value, max));
+        match tokio::time::timeout(filter::JQ_TIMEOUT + JQ_GRACE, run).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(e)) => Err(format!("jq filter crashed: {e}")),
+            Err(_) => Err("jq filter ran too long and was abandoned.".into()),
+        }
+    }
+
     /// Events from the gateway's buffer, waiting for one if asked to.
     async fn events(&self, args: EventsArgs) -> Result<String, String> {
         let Some(gateway) = &self.gateway else {
-            return Err(if self.rest.is_none() {
-                "No bot token: set DISCORD_TOKEN in this server's environment, then reconnect.".to_owned()
-            } else {
-                "This server runs without the gateway (--disable-gateway), so there are no events. REST still \
-                 answers what happened: recent messages with GET /channels/{channel_id}/messages."
-                    .to_owned()
-            });
+            return Err(self.no_gateway());
         };
         // The first call opens the session; its cursor should point past the servers arriving.
         if gateway.start() || matches!(gateway.state(), State::Connecting) {
@@ -739,6 +825,11 @@ mod tests {
             .map(|t| t.name.to_string())
             .collect();
         assert_eq!(with_events, [DOCS, GET, EVENTS]);
+        let everything: Vec<String> = definitions(&options(), true)
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        assert_eq!(everything, [DOCS, GET, CALL, EVENTS, GATEWAY]);
     }
 
     #[test]

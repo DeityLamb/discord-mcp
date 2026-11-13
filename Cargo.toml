@@ -7,9 +7,16 @@ description = "MCP server for Discord: the whole REST API through one passthroug
 license = "GPL-3.0-or-later"
 repository = "https://github.com/DeityLamb/discord-mcp"
 readme = "README.md"
-exclude = [".github", "site", "install.sh", "install.ps1", "release-plz.toml"]
+exclude = [".github", "site", "spec", "tests", "install.sh", "install.ps1", "release-plz.toml"]
 keywords = ["mcp", "discord", "llm", "bot", "ai"]
 categories = ["command-line-utilities"]
+
+[profile.release]
+# A server that waits on the network has no use for the last few percent of speed: small instead.
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+strip = true
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }{ archive-suffix }"
